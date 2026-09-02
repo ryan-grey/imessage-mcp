@@ -5,6 +5,7 @@
 
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 from pathlib import Path
@@ -129,6 +130,47 @@ def test_contact_name_join():
     thread = json.loads(server.get_thread(chat_id="iMessage;+;chat00000fixture"))
     names = {m["sender"]: m["sender_name"] for m in thread["messages"]}
     assert names == {"+15550002222": None, "fixture@example.com": "Blake Sample"}
+
+
+def test_owner_name_on_from_me_rows():
+    server._OWNER["at"] = 0.0
+    out = json.loads(server.get_thread(handle="+15550001111"))
+    mine = [m for m in out["messages"] if m["from_me"]]
+    assert mine and all(m["sender_name"] == "Riley Owner" for m in mine)
+    theirs = [m for m in out["messages"] if not m["from_me"]]
+    assert all(m["sender_name"] == "Alex Fixture" for m in theirs)
+    search = json.loads(server.search_messages("pizza"))
+    sent = next(m for m in search["messages"] if m["from_me"])
+    assert sent["sender_name"] == "Riley Owner"
+
+
+def test_addressbook_reads_wal_fresh_names():
+    """A rename synced from iCloud sits in the AddressBook's WAL until
+    Contacts checkpoints. immutable=1 serves the stale checkpointed name;
+    the ro-first open must see the new one."""
+    ab = os.environ["IMESSAGE_ADDRESSBOOK_GLOB"]
+    w = sqlite3.connect(ab)
+    w.execute("PRAGMA journal_mode=WAL")
+    w.execute("UPDATE ZABCDRECORD SET ZLASTNAME='Arrington'"
+              " WHERE ZFIRSTNAME='Alex'")
+    w.commit()  # committed into the WAL; closing would checkpoint, so don't
+    try:
+        stale = sqlite3.connect(f"file:{ab}?mode=ro&immutable=1", uri=True)
+        old = stale.execute("SELECT ZLASTNAME FROM ZABCDRECORD"
+                            " WHERE ZFIRSTNAME='Alex'").fetchone()[0]
+        stale.close()
+        assert old == "Fixture"  # proves immutable=1 would show the old name
+        refreshed = json.loads(server.refresh_contacts())
+        assert refreshed["contacts_mapped"] >= 3
+        assert refreshed["owner_name"] == "Riley Owner"
+        assert server._name_for("+15550001111") == "Alex Arrington"
+    finally:
+        w.execute("UPDATE ZABCDRECORD SET ZLASTNAME='Fixture'"
+                  " WHERE ZFIRSTNAME='Alex'")
+        w.commit()
+        w.close()
+        server._CONTACTS["at"] = 0.0
+        server._OWNER["at"] = 0.0
 
 
 def test_index_status():

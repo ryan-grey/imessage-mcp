@@ -36,6 +36,7 @@ no way to do either. It does not control your screen.
 | `list_chats(limit=30, since?)` | Recent chats with display name, participants, last-message preview/time, unread count. |
 | `get_thread(chat_id \| handle, since?, until?, limit=200)` | Ordered messages for one chat (guid, chat identifier, or display name) or one 1:1 handle. |
 | `get_contact_handles(name)` | Resolve a contact name to phone/email handles via the AddressBook database; falls back to handles seen in chat.db. |
+| `refresh_contacts()` | Rebuild the handle→name map right now (it otherwise caches for five minutes) — use after renaming a contact. |
 | `index_status()` | Row counts, newest message timestamp, FTS index state, and whether attributedBody decoding is working. |
 | `send_message(to, text, attachment_path?, confirm)` | Send to a handle or an existing chat id (group chats included). Refuses unless `confirm` is `true`. |
 
@@ -43,8 +44,11 @@ Messages come back with sender, direction (`from_me`), local ISO timestamp,
 chat name, body text, and attachments as filenames + paths only (the files
 themselves are never opened). When the AddressBook database is readable,
 handles are joined to contact names everywhere they appear — `sender_name`
-on messages, names on chat participants, and 1:1 chats titled by contact
-instead of raw number.
+on messages (your own card's name on `from_me` rows, resolved from the
+Messages account handle; `IMESSAGE_OWNER_NAME` overrides), names on chat
+participants, and 1:1 chats titled by contact instead of raw number. The
+AddressBook is opened plain read-only rather than immutable, so renames
+synced from iCloud are picked up from its WAL immediately.
 
 ## Contacts tools (`contacts.py`)
 
@@ -52,13 +56,23 @@ instead of raw number.
 | --- | --- |
 | `list_contacts(query?, container?, group?, limit=100)` | Contacts with name, org, phones, emails, addresses, notes, account (iCloud/Google/local), and group memberships. |
 | `get_contact(identifier \| name)` | One fully annotated card; an ambiguous name returns the candidates. |
-| `find_duplicates(strategy)` | Clusters sharing a phone, email, or normalized name, with the fields that differ between the cards. |
+| `find_duplicates(strategy)` | Clusters sharing a phone, email, or normalized name, with the fields that differ between the cards (phones/emails capped at 5 per card with a `+N more` marker). |
+| `linked_cards(identifier \| name)` | The per-account cards behind one unified contact — identifier, container, full fields, groups, and which fields differ. Accepts the unified id or any piece id. |
+| `export_contacts(container?, path?)` | Restorable backup pair: an Apple-serialized vCard 3.0 file (photos included) plus a JSON file carrying what vCard drops — per-card container, group memberships, and linked pieces. Defaults to `~/Documents/Claude/contacts-backups/`. |
+| `authorization_status()` | The raw Contacts TCC state (`notDetermined`/`denied`/`authorized`/…) without triggering the permission prompt — tells a denied grant apart from a code bug. |
 | `create_contact(fields, container="iCloud", confirm)` | New card in an explicit container. |
 | `update_contact(identifier, fields, confirm)` | Replace the given fields on a card. |
 | `delete_contact(identifier, confirm)` | Delete a card permanently. |
 | `create_group(name, container="iCloud", confirm)` / `add_to_group` / `remove_from_group` | Group management. |
 | `move_to_container(identifier, "iCloud", confirm)` | Copy the card into the target account with all fields, re-add group memberships that exist there, then delete the source card. |
 | `merge_contacts(identifiers[], keep, confirm)` | Union of phones/emails/addresses/notes/groups onto the kept card, delete the rest, return the merged card. |
+
+Cards that CNContactStore presents as unified (linked) contacts are labeled
+`"container": "linked"` with their per-account pieces listed; write tools
+refuse a multi-piece unified identifier and name the pieces to use instead.
+A unified card over exactly one underlying card — residue of past linking —
+resolves to that card's container and carries a `piece_identifier` field
+naming the real card for writes.
 
 Contacts safety rules:
 
