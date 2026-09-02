@@ -345,13 +345,15 @@ class _RealCN:
             pred = None
         return [self._shape(c) for c in self._enumerate(pred, keys, unified)]
 
-    def _piece_obj(self, identifier):
+    def _piece_obj(self, identifier, keys=None):
         """The raw per-container card with this exact identifier, or None
         if the identifier only names a unified contact."""
         C = self._fw()
         pred = C.CNContact.predicateForContactsWithIdentifiers_([identifier])
         found = self._enumerate(
-            pred, self._keys(with_note=self._with_note()), unified=False
+            pred,
+            keys or self._keys(with_note=self._with_note()),
+            unified=False,
         )
         return found[0] if found else None
 
@@ -365,16 +367,22 @@ class _RealCN:
         )
         return self._shape(c) if c is not None else None
 
-    def _raw(self, identifier):
+    def _raw(self, identifier, extra_keys=None):
         """The mutable CNContact behind an identifier, for save requests.
         Prefers the exact per-container piece so writes land on one real
-        card, falling back to the unified contact."""
-        piece = self._piece_obj(identifier)
+        card, falling back to the unified contact. Setting a property the
+        fetch did not request throws CNPropertyNotFetchedException, so a
+        write touching more than the standard fields (the photo) must pass
+        those keys in extra_keys."""
+        keys = self._keys(with_note=self._with_note())
+        if extra_keys:
+            keys = keys + list(extra_keys)
+        piece = self._piece_obj(identifier, keys)
         if piece is not None:
             return piece.mutableCopy()
         store = self._store()
         c, err = store.unifiedContactWithIdentifier_keysToFetch_error_(
-            identifier, self._keys(with_note=self._with_note()), None
+            identifier, keys, None
         )
         if c is None:
             raise RuntimeError(f"no contact with identifier {identifier!r}")
@@ -611,7 +619,13 @@ class _RealCN:
 
     def set_image(self, identifier, data):
         C = self._fw()
-        mc = self._raw(identifier)
+        mc = self._raw(
+            identifier,
+            extra_keys=[
+                C.CNContactImageDataKey,
+                C.CNContactImageDataAvailableKey,
+            ],
+        )
         mc.setImageData_(data)
         req = C.CNSaveRequest.alloc().init()
         req.updateContact_(mc)
