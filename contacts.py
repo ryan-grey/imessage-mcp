@@ -44,6 +44,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -748,6 +749,32 @@ def _resolve_contact(identifier="", name=""):
     )
 
 
+_GROUPS = {"at": 0.0, "groups": [], "members": {}}
+
+
+def _group_map():
+    """Groups plus their member-id sets, fetched once and cached for 30
+    seconds. Annotating N cards without this costs N x groups full
+    framework fetches - minutes of silence on a real address book."""
+    if time.time() - _GROUPS["at"] > 30:
+        groups = CN.groups()
+        _GROUPS["groups"] = groups
+        _GROUPS["members"] = {
+            g["id"]: set(CN.group_member_ids(g["id"])) for g in groups
+        }
+        _GROUPS["at"] = time.time()
+    return _GROUPS["groups"], _GROUPS["members"]
+
+
+def _groups_stale():
+    _GROUPS["at"] = 0.0
+
+
+def _groups_of(identifier):
+    groups, members = _group_map()
+    return [g for g in groups if identifier in members[g["id"]]]
+
+
 def _annotate(card):
     """Add display name, container label, and group names to a card.
     A unified contact resolves to no container; those are labeled
@@ -779,11 +806,7 @@ def _annotate(card):
             card["container"] = None
     else:
         card["container"] = _account_label(container)
-    card["groups"] = [
-        g["name"]
-        for g in CN.groups()
-        if card["identifier"] in CN.group_member_ids(g["id"])
-    ]
+    card["groups"] = [g["name"] for g in _groups_of(card["identifier"])]
     return card
 
 
@@ -1033,11 +1056,7 @@ def linked_cards(identifier: str = "", name: str = "") -> str:
                     if holder
                     else None
                 ),
-                "groups": [
-                    g["name"]
-                    for g in CN.groups()
-                    if p["identifier"] in CN.group_member_ids(g["id"])
-                ],
+                "groups": [g["name"] for g in _groups_of(p["identifier"])],
             }
         )
     differing = [
@@ -1231,6 +1250,7 @@ def delete_contact(identifier: str, confirm: bool = False) -> str:
     if before is None:
         return json.dumps({"ok": False, "error": f"no contact {identifier!r}"})
     CN.delete(identifier)
+    _groups_stale()
     _log_change("delete_contact", identifier, before, None, "ok")
     return json.dumps({"ok": True, "deleted": _display_name(before)})
 
@@ -1273,6 +1293,7 @@ def create_group(name: str, container: str = "iCloud",
         return _refuse("create_group")
     target = _resolve_container(container)
     gid = CN.create_group(name, target["id"])
+    _groups_stale()
     _log_change("create_group", gid, None, {"name": name,
                 "container": _account_label(target)}, "ok")
     return json.dumps({"ok": True, "group": {"id": gid, "name": name}})
@@ -1287,6 +1308,7 @@ def add_to_group(identifier: str, group: str, confirm: bool = False) -> str:
         return refusal
     g = _resolve_group(group)
     CN.add_member(identifier, g["id"])
+    _groups_stale()
     _log_change("add_to_group", identifier, None, {"group": g["name"]}, "ok")
     return json.dumps({"ok": True, "added_to": g["name"]})
 
@@ -1300,6 +1322,7 @@ def remove_from_group(identifier: str, group: str, confirm: bool = False) -> str
         return refusal
     g = _resolve_group(group)
     CN.remove_member(identifier, g["id"])
+    _groups_stale()
     _log_change("remove_from_group", identifier, {"group": g["name"]}, None, "ok")
     return json.dumps({"ok": True, "removed_from": g["name"]})
 
@@ -1322,10 +1345,7 @@ def move_to_container(identifier: str, container: str = "iCloud",
     if source and source["id"] == target["id"]:
         return json.dumps({"ok": False, "error": "card is already in "
                            + _account_label(target)})
-    old_groups = [
-        g for g in CN.groups()
-        if identifier in CN.group_member_ids(g["id"])
-    ]
+    old_groups = _groups_of(identifier)
     fields = {
         k: v
         for k, v in before.items()
@@ -1353,6 +1373,7 @@ def move_to_container(identifier: str, container: str = "iCloud",
         else:
             dropped.append(g["name"])
     CN.delete(identifier)
+    _groups_stale()
     after = _annotate(CN.get(new_id))
     _log_change("move_to_container", identifier, before, after, "ok")
     return json.dumps(
@@ -1394,19 +1415,21 @@ def merge_contacts(identifiers: list, keep: str, confirm: bool = False) -> str:
         except RuntimeError:
             pass  # notes not writable without the entitlement; keep's stands
     CN.update(keep, fields)
-    group_ids = set()
-    for ident in identifiers:
-        if ident == keep:
-            continue
-        for g in CN.groups():
-            if ident in CN.group_member_ids(g["id"]):
-                group_ids.add(g["id"])
+    _groups, members = _group_map()
+    group_ids = {
+        g["id"]
+        for ident in identifiers
+        if ident != keep
+        for g in _groups_of(ident)
+    }
     for gid in group_ids:
-        if keep not in CN.group_member_ids(gid):
+        if keep not in members[gid]:
             CN.add_member(keep, gid)
+    _groups_stale()
     for ident in identifiers:
         if ident != keep:
             CN.delete(ident)
+    _groups_stale()
     after = _annotate(CN.get(keep))
     _log_change("merge_contacts", keep, cards, after, "ok")
     return json.dumps({"ok": True, "contact": after}, ensure_ascii=False)

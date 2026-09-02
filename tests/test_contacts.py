@@ -180,6 +180,7 @@ class FakeCN:
 def fresh():
     fake = FakeCN()
     contacts.CN = fake
+    contacts._GROUPS["at"] = 0.0  # drop the group-map cache with the fake
     a = fake.seed({"given_name": "Alex", "family_name": "Fixture",
                    "phones": [{"label": "mobile", "value": "+1 (555) 000-1111"}],
                    "emails": [{"label": "home", "value": "alex@example.com"}]})
