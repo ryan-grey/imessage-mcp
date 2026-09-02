@@ -1,0 +1,21 @@
+# Local state - never commit message data or send history
+index.db
+index.db-shm
+index.db-wal
+sent.log
+
+# Anything that could hold real handles or config
+.env
+.env.*
+config.json
+config.*.json
+
+# Never a real database in the repo - fixtures are generated synthetically
+chat.db
+*.abcddb
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
