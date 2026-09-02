@@ -46,9 +46,15 @@ themselves are never opened). When the AddressBook database is readable,
 handles are joined to contact names everywhere they appear — `sender_name`
 on messages (your own card's name on `from_me` rows, resolved from the
 Messages account handle; `IMESSAGE_OWNER_NAME` overrides), names on chat
-participants, and 1:1 chats titled by contact instead of raw number. The
-AddressBook is opened plain read-only rather than immutable, so renames
-synced from iCloud are picked up from its WAL immediately.
+participants, and 1:1 chats titled by contact instead of raw number. Names
+resolve through Contacts.framework (CNContactStore) when the process holds
+the Contacts grant — the same unified view Contacts.app shows, with the
+owner's name taken from the "me card". Without the grant it falls back to
+reading the AddressBook SQLite directly: only the per-account stores under
+`Sources/` (newest first — the pre-Sources root store is legacy data),
+opened plain read-only rather than immutable so renames synced from iCloud
+are picked up from the WAL immediately. `index_status` reports which source
+fed the join.
 
 ## Contacts tools (`contacts.py`)
 

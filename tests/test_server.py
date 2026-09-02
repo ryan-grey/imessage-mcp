@@ -19,12 +19,19 @@ import make_fixture
 _TMP = tempfile.mkdtemp(prefix="imessage-mcp-test-")
 _FIXTURE = os.path.join(_TMP, "fixture-chat.db")
 make_fixture.build(_FIXTURE)
-_AB = os.path.join(_TMP, "AddressBook-v22.abcddb")
+# Mirror the real layout: <root>/AddressBook-v22.abcddb is the legacy
+# pre-Sources store; per-account books live under Sources/<uuid>/.
+_ABROOT = os.path.join(_TMP, "AddressBook")
+_AB = os.path.join(_ABROOT, "Sources", "11111111-AAAA",
+                   "AddressBook-v22.abcddb")
+os.makedirs(os.path.dirname(_AB))
 make_fixture.build_addressbook(_AB)
 os.environ["IMESSAGE_CHAT_DB"] = _FIXTURE
 os.environ["IMESSAGE_INDEX_DB"] = os.path.join(_TMP, "index.db")
 os.environ["IMESSAGE_SENT_LOG"] = os.path.join(_TMP, "sent.log")
-os.environ["IMESSAGE_ADDRESSBOOK_GLOB"] = _AB
+os.environ["IMESSAGE_ADDRESSBOOK_GLOB"] = os.path.join(
+    _ABROOT, "**", "AddressBook-v22.abcddb")
+os.environ["IMESSAGE_NAME_SOURCE"] = "sqlite"  # force the fallback path
 
 import server  # noqa: E402  (env must be set before this import)
 
@@ -147,6 +154,43 @@ def test_org_only_contacts_resolve():
     ]
 
 
+def test_root_legacy_store_is_ignored_when_sources_exist():
+    """The pre-Sources root db on the real Mac held ANOTHER family
+    member's 669-row book ('Mom', 'NeyNey', owner 'dad') and must never
+    feed the name join while per-account Sources books exist."""
+    root_db = os.path.join(_ABROOT, "AddressBook-v22.abcddb")
+    make_fixture.build_addressbook_min(
+        root_db, [("Mom", None, None, "(555) 000-1111")])
+    server._CONTACTS["at"] = 0.0
+    try:
+        assert server._name_for("+15550001111") == "Alex Fixture"
+        src = json.loads(server.index_status())["contacts_source"]
+        assert src["via"].startswith("AddressBook SQLite")
+        assert all("Sources" in f["path"] for f in src["files"])
+        assert all(f["path"] != root_db for f in src["files"])
+    finally:
+        os.remove(root_db)
+        server._CONTACTS["at"] = 0.0
+
+
+def test_newest_source_wins_name_collisions():
+    other = os.path.join(_ABROOT, "Sources", "99999999-BBBB",
+                         "AddressBook-v22.abcddb")
+    os.makedirs(os.path.dirname(other))
+    make_fixture.build_addressbook_min(
+        other, [("Fresher", "Name", None, "(555) 000-1111")])
+    os.utime(_AB, (1000000000, 1000000000))  # main fixture goes stale
+    server._CONTACTS["at"] = 0.0
+    try:
+        assert server._name_for("+15550001111") == "Fresher Name"
+        # non-colliding entries from the older source still resolve
+        assert server._name_for("fixture@example.com") == "Blake Sample"
+    finally:
+        os.remove(other)
+        os.removedirs(os.path.dirname(other))
+        server._CONTACTS["at"] = 0.0
+
+
 def test_owner_name_on_from_me_rows():
     server._OWNER["at"] = 0.0
     out = json.loads(server.get_thread(handle="+15550001111"))
@@ -163,14 +207,13 @@ def test_addressbook_reads_wal_fresh_names():
     """A rename synced from iCloud sits in the AddressBook's WAL until
     Contacts checkpoints. immutable=1 serves the stale checkpointed name;
     the ro-first open must see the new one."""
-    ab = os.environ["IMESSAGE_ADDRESSBOOK_GLOB"]
-    w = sqlite3.connect(ab)
+    w = sqlite3.connect(_AB)
     w.execute("PRAGMA journal_mode=WAL")
     w.execute("UPDATE ZABCDRECORD SET ZLASTNAME='Arrington'"
               " WHERE ZFIRSTNAME='Alex'")
     w.commit()  # committed into the WAL; closing would checkpoint, so don't
     try:
-        stale = sqlite3.connect(f"file:{ab}?mode=ro&immutable=1", uri=True)
+        stale = sqlite3.connect(f"file:{_AB}?mode=ro&immutable=1", uri=True)
         old = stale.execute("SELECT ZLASTNAME FROM ZABCDRECORD"
                             " WHERE ZFIRSTNAME='Alex'").fetchone()[0]
         stale.close()
