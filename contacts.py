@@ -36,10 +36,13 @@ Safety, by construction:
 """
 
 import datetime
+import functools
 import json
 import os
 import re
+import sys
 import threading
+from collections import Counter
 from pathlib import Path
 
 from mcp.server.mcpserver import MCPServer
@@ -49,6 +52,12 @@ CHANGES_LOG = Path(
     os.environ.get("CONTACTS_CHANGES_LOG", REPO_DIR / "contacts-changes.log")
 )
 ICLOUD_OVERRIDE = os.environ.get("CONTACTS_ICLOUD_CONTAINER_ID", "")
+BACKUP_DIR = Path(
+    os.environ.get(
+        "CONTACTS_BACKUP_DIR",
+        Path.home() / "Documents/Claude/contacts-backups",
+    )
+)
 
 mcp = MCPServer(
     name="contacts",
@@ -471,6 +480,47 @@ class _RealCN:
             req.removeMember_fromGroup_(mc, group)
         self._execute(req)
 
+    def authorization_status(self):
+        """Raw CNContactStore authorization status. Never triggers the
+        system prompt - it only reads the current TCC state."""
+        C = self._fw()
+        return int(
+            C.CNContactStore.authorizationStatusForEntityType_(
+                C.CNEntityTypeContacts
+            )
+        )
+
+    def vcard_export(self, container_id=None):
+        """Every card (optionally one container) as Apple-serialized vCard
+        bytes, photos included."""
+        C = self._fw()
+        store = self._store()
+        keys = [
+            C.CNContactVCardSerialization.descriptorForRequiredKeys(),
+            C.CNContactImageDataKey,
+        ]
+        if container_id:
+            pred = C.CNContact.predicateForContactsInContainerWithIdentifier_(
+                container_id
+            )
+            found, err = store.unifiedContactsMatchingPredicate_keysToFetch_error_(
+                pred, keys, None
+            )
+            if err is not None:
+                raise RuntimeError(str(err))
+        else:
+            found = []
+            req = C.CNContactFetchRequest.alloc().initWithKeysToFetch_(keys)
+            store.enumerateContactsWithFetchRequest_error_usingBlock_(
+                req, None, lambda c, stop: found.append(c)
+            )
+        data, err = C.CNContactVCardSerialization.dataWithContacts_error_(
+            list(found or []), None
+        )
+        if data is None:
+            raise RuntimeError(f"vCard serialization failed: {err}")
+        return bytes(data)
+
 
 CN = _RealCN()  # tests replace this with a fake adapter
 
@@ -666,6 +716,106 @@ def find_duplicates(strategy: str = "phone") -> str:
     )
 
 
+def authorization_status() -> str:
+    """The raw Contacts authorization state, to tell a TCC denial apart
+    from a code bug. Never triggers the permission prompt."""
+    labels = {0: "notDetermined", 1: "restricted", 2: "denied",
+              3: "authorized", 4: "limited"}
+    status = CN.authorization_status()
+    return json.dumps(
+        {
+            "status": status,
+            "meaning": labels.get(status, f"unknown({status})"),
+            "python": sys.executable,
+            "note": "macOS attributes the grant to the app that launches "
+            "this server - the Claude desktop app when spawned from "
+            "claude_desktop_config.json, or your terminal app when run by "
+            "hand. Grant lives under System Settings > Privacy & Security "
+            "> Contacts.",
+        }
+    )
+
+
+def export_contacts(container: str = "", path: str = "") -> str:
+    """Full restorable backup of Contacts: an Apple-serialized vCard 3.0
+    file (importable by Contacts.app/iCloud.com, photos included) plus a
+    JSON file carrying what vCard drops - each card's container and group
+    memberships, and the full container/group lists. Read-only; files land
+    in ~/Documents/Claude/contacts-backups/ (override the parent with
+    path). Empty container exports everything."""
+    target = _resolve_container(container) if container else None
+    cid = target["id"] if target else None
+    cards = CN.fetch(container_id=cid)
+
+    containers = [
+        {**c, "account": _account_label(c)} for c in CN.containers()
+    ]
+    groups = []
+    membership = {}
+    for c in containers:
+        for g in CN.groups(c["id"]):
+            g = {**g, "container_id": c["id"], "account": c["account"]}
+            groups.append(g)
+            membership[g["id"]] = set(CN.group_member_ids(g["id"]))
+
+    def _card_doc(card):
+        holder = CN.container_of(card["identifier"])
+        return {
+            **card,
+            "name": _display_name(card),
+            "container": (
+                {**holder, "account": _account_label(holder)} if holder else None
+            ),
+            "groups": [
+                {"id": g["id"], "name": g["name"]}
+                for g in groups
+                if card["identifier"] in membership[g["id"]]
+            ],
+        }
+
+    docs = [_card_doc(c) for c in cards]
+    counts = Counter(
+        (d["container"] or {}).get("account") or "unknown" for d in docs
+    )
+
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    parent = Path(path) if path else BACKUP_DIR
+    parent.mkdir(parents=True, exist_ok=True)
+    vcf_path = parent / f"contacts-{stamp}.vcf"
+    json_path = parent / f"contacts-{stamp}.json"
+
+    vcf_path.write_bytes(CN.vcard_export(cid))
+    json_path.write_text(
+        json.dumps(
+            {
+                "exported_at": datetime.datetime.now()
+                .astimezone()
+                .isoformat(timespec="seconds"),
+                "scope": _account_label(target) if target else "all containers",
+                "containers": containers,
+                "groups": groups,
+                "contacts": docs,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    result = {
+        "count": len(docs),
+        "vcf": str(vcf_path),
+        "json": str(json_path),
+        "containers": dict(counts),
+        "bytes": {
+            "vcf": vcf_path.stat().st_size,
+            "json": json_path.stat().st_size,
+        },
+    }
+    _log_change("export_contacts", str(parent), None,
+                {k: result[k] for k in ("count", "vcf", "json")}, "ok")
+    return json.dumps(result, ensure_ascii=False)
+
+
 # ------------------------------------------------------------ write tools --
 
 
@@ -833,12 +983,29 @@ def merge_contacts(identifiers: list, keep: str, confirm: bool = False) -> str:
     return json.dumps({"ok": True, "contact": after}, ensure_ascii=False)
 
 
+def _safe(fn):
+    """Return the real exception as a tool result instead of letting the
+    MCP layer swallow it into a bare 'Error executing tool'. A TCC denial
+    then reads as exactly that, not as a mystery."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:  # surfaced to the caller, never swallowed
+            return json.dumps({"error": f"{type(e).__name__}: {e}"})
+
+    return wrapper
+
+
 # Registered here rather than via decorators so the functions above stay
 # plain callables for the test suite.
 for _fn in (
+    authorization_status,
     list_contacts,
     get_contact,
     find_duplicates,
+    export_contacts,
     create_contact,
     update_contact,
     delete_contact,
@@ -848,7 +1015,7 @@ for _fn in (
     move_to_container,
     merge_contacts,
 ):
-    mcp.tool()(_fn)
+    mcp.tool()(_safe(_fn))
 
 
 if __name__ == "__main__":
