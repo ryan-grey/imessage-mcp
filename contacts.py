@@ -40,7 +40,9 @@ import functools
 import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import threading
 from collections import Counter
 from pathlib import Path
@@ -126,7 +128,8 @@ def _merged_fields(cards, keep_id):
         k: keep.get(k) or next(
             (c.get(k) for c in others if c.get(k)), None
         )
-        for k in ("given_name", "middle_name", "family_name", "organization")
+        for k in ("given_name", "middle_name", "family_name", "organization",
+                  "job_title", "department", "nickname")
     }
     fields["phones"] = _union_labeled(
         keep.get("phones"), *[c.get("phones") for c in others], norm=_norm_phone
@@ -136,6 +139,14 @@ def _merged_fields(cards, keep_id):
     )
     fields["addresses"] = _union_labeled(
         keep.get("addresses"), *[c.get("addresses") for c in others],
+        norm=lambda v: v,
+    )
+    fields["urls"] = _union_labeled(
+        keep.get("urls"), *[c.get("urls") for c in others],
+        norm=lambda v: (v or "").strip().lower(),
+    )
+    fields["social_profiles"] = _union_labeled(
+        keep.get("social_profiles"), *[c.get("social_profiles") for c in others],
         norm=lambda v: v,
     )
     notes = [c.get("note") for c in cards if c.get("note")]
@@ -207,9 +218,15 @@ class _RealCN:
             C.CNContactMiddleNameKey,
             C.CNContactFamilyNameKey,
             C.CNContactOrganizationNameKey,
+            C.CNContactJobTitleKey,
+            C.CNContactDepartmentNameKey,
+            C.CNContactNicknameKey,
             C.CNContactPhoneNumbersKey,
             C.CNContactEmailAddressesKey,
             C.CNContactPostalAddressesKey,
+            C.CNContactUrlAddressesKey,
+            C.CNContactSocialProfilesKey,
+            C.CNContactImageDataAvailableKey,
         ]
         if with_note:
             keys.append(C.CNContactNoteKey)
@@ -223,6 +240,25 @@ class _RealCN:
             "middle_name": str(c.middleName() or ""),
             "family_name": str(c.familyName() or ""),
             "organization": str(c.organizationName() or ""),
+            "job_title": str(c.jobTitle() or ""),
+            "department": str(c.departmentName() or ""),
+            "nickname": str(c.nickname() or ""),
+            "urls": [
+                {"label": _clean_label(lv.label()), "value": str(lv.value())}
+                for lv in c.urlAddresses()
+            ],
+            "social_profiles": [
+                {
+                    "service": str(lv.value().service() or ""),
+                    "username": str(lv.value().username() or ""),
+                    "url": str(lv.value().urlString() or ""),
+                }
+                for lv in c.socialProfiles()
+            ],
+            "has_image": bool(
+                c.isKeyAvailable_(C.CNContactImageDataAvailableKey)
+                and c.imageDataAvailable()
+            ),
             "phones": [
                 {
                     "label": _clean_label(lv.label()),
@@ -425,10 +461,39 @@ class _RealCN:
             "middle_name": mc.setMiddleName_,
             "family_name": mc.setFamilyName_,
             "organization": mc.setOrganizationName_,
+            "job_title": mc.setJobTitle_,
+            "department": mc.setDepartmentName_,
+            "nickname": mc.setNickname_,
         }
         for key, setter in scalars.items():
             if key in fields:
                 setter(fields[key] or "")
+        if "urls" in fields:
+            mc.setUrlAddresses_(
+                [
+                    C.CNLabeledValue.labeledValueWithLabel_value_(
+                        u.get("label") or C.CNLabelURLAddressHomePage,
+                        u["value"],
+                    )
+                    for u in fields["urls"]
+                ]
+            )
+        if "social_profiles" in fields:
+            mc.setSocialProfiles_(
+                [
+                    C.CNLabeledValue.labeledValueWithLabel_value_(
+                        p.get("service") or "",
+                        C.CNSocialProfile.alloc()
+                        .initWithUrlString_username_userIdentifier_service_(
+                            p.get("url") or None,
+                            p.get("username") or "",
+                            None,
+                            p.get("service") or "",
+                        ),
+                    )
+                    for p in fields["social_profiles"]
+                ]
+            )
         if "note" in fields:
             if not self._with_note():
                 raise RuntimeError(
@@ -531,6 +596,35 @@ class _RealCN:
         else:
             req.removeMember_fromGroup_(mc, group)
         self._execute(req)
+
+    def photo(self, identifier):
+        """The contact's image bytes, or None."""
+        C = self._fw()
+        store = self._store()
+        c, _err = store.unifiedContactWithIdentifier_keysToFetch_error_(
+            identifier, [C.CNContactImageDataKey], None
+        )
+        if c is None or not c.isKeyAvailable_(C.CNContactImageDataKey):
+            return None
+        data = c.imageData()
+        return bytes(data) if data is not None else None
+
+    def set_image(self, identifier, data):
+        C = self._fw()
+        mc = self._raw(identifier)
+        mc.setImageData_(data)
+        req = C.CNSaveRequest.alloc().init()
+        req.updateContact_(mc)
+        self._execute(req)
+
+    def me_card(self):
+        """The unified 'me' contact, or None when none is set."""
+        C = self._fw()
+        store = self._store()
+        me, _err = store.unifiedMeContactWithKeysToFetch_error_(
+            self._keys(with_note=self._with_note()), None
+        )
+        return self._shape(me) if me is not None else None
 
     def authorization_status(self):
         """Raw CNContactStore authorization status. Never triggers the
@@ -744,6 +838,50 @@ def _log_change(tool, target, before, after, result):
         )
 
 
+def _image_dims(path):
+    out = subprocess.run(
+        ["sips", "-g", "pixelWidth", "-g", "pixelHeight", str(path)],
+        capture_output=True, text=True, timeout=30,
+    )
+    dims = {}
+    for line in out.stdout.splitlines():
+        for key in ("pixelWidth", "pixelHeight"):
+            if f"{key}:" in line:
+                dims[key] = int(line.rsplit(":", 1)[1])
+    return dims.get("pixelWidth"), dims.get("pixelHeight")
+
+
+def _prepare_photo(path):
+    """JPEG/PNG bytes for a contact photo, downscaled to at most 1024px
+    on the long side (via the system sips tool) so iCloud sync doesn't
+    choke on multi-megapixel originals."""
+    with open(path, "rb") as f:
+        head = f.read(12)
+    if not (head.startswith(b"\x89PNG") or head.startswith(b"\xff\xd8")):
+        raise RuntimeError(f"not a JPEG or PNG file: {path}")
+    w, h = _image_dims(path)
+    if w and h and max(w, h) > 1024:
+        fd, tmp = tempfile.mkstemp(
+            prefix="contact-photo-", suffix=Path(path).suffix or ".png"
+        )
+        os.close(fd)
+        try:
+            proc = subprocess.run(
+                ["sips", "-Z", "1024", str(path), "--out", tmp],
+                capture_output=True, text=True, timeout=60,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    "downscale failed: " + (proc.stderr.strip() or "sips error")
+                )
+            with open(tmp, "rb") as f:
+                return f.read()
+        finally:
+            os.unlink(tmp)
+    with open(path, "rb") as f:
+        return f.read()
+
+
 def _refuse(tool):
     return json.dumps(
         {
@@ -788,12 +926,35 @@ def list_contacts(
     )
 
 
-def get_contact(identifier: str = "", name: str = "") -> str:
-    """One contact by identifier or (unambiguous) name, fully annotated."""
+def get_contact(identifier: str = "", name: str = "",
+                include_photo: bool = False) -> str:
+    """One contact by identifier or (unambiguous) name, fully annotated.
+    include_photo=true also writes the photo to a temp file and returns
+    its photo_path."""
     try:
         card = _resolve_contact(identifier, name)
     except RuntimeError as e:
         return json.dumps({"error": str(e)})
+    card = _annotate(card)
+    if include_photo and card.get("has_image"):
+        data = CN.photo(card["identifier"])
+        if data:
+            ext = ".png" if data.startswith(b"\x89PNG") else ".jpeg"
+            fd, path = tempfile.mkstemp(prefix="contact-photo-", suffix=ext)
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            card["photo_path"] = path
+    return json.dumps(card, ensure_ascii=False)
+
+
+def me_card() -> str:
+    """The owner's own 'me' contact, fully annotated - so nobody has to
+    guess which card is the owner. Error when no me card is set."""
+    card = CN.me_card()
+    if card is None:
+        return json.dumps(
+            {"error": "no 'me' card is set in Contacts on this Mac"}
+        )
     return json.dumps(_annotate(card), ensure_ascii=False)
 
 
@@ -1014,9 +1175,11 @@ def export_contacts(container: str = "", path: str = "") -> str:
 
 def create_contact(fields: dict, container: str = "iCloud",
                    confirm: bool = False) -> str:
-    """Create a card. fields: given_name, family_name, organization, note,
-    phones/emails as [{label, value}], addresses as [{label, street, city,
-    state, postal_code, country}]. Requires confirm=true."""
+    """Create a card. fields: given_name, family_name, organization,
+    job_title, department, nickname, note, phones/emails/urls as
+    [{label, value}], addresses as [{label, street, city, state,
+    postal_code, country}], social_profiles as [{service, username,
+    url?}]. Requires confirm=true."""
     if confirm is not True:
         return _refuse("create_contact")
     target = _resolve_container(container)
@@ -1056,6 +1219,37 @@ def delete_contact(identifier: str, confirm: bool = False) -> str:
     CN.delete(identifier)
     _log_change("delete_contact", identifier, before, None, "ok")
     return json.dumps({"ok": True, "deleted": _display_name(before)})
+
+
+def set_photo(identifier: str, path: str, confirm: bool = False) -> str:
+    """Set a contact's photo from a local JPEG/PNG file, downscaled to at
+    most 1024px on the long side. Requires confirm=true."""
+    if confirm is not True:
+        return _refuse("set_photo")
+    refusal = _linked_refusal(identifier)
+    if refusal:
+        return refusal
+    if not os.path.isfile(path):
+        return json.dumps({"ok": False, "error": f"no such file: {path}"})
+    before = CN.get(identifier)
+    if before is None:
+        return json.dumps({"ok": False, "error": f"no contact {identifier!r}"})
+    try:
+        data = _prepare_photo(path)
+    except RuntimeError as e:
+        return json.dumps({"ok": False, "error": str(e)})
+    CN.set_image(identifier, data)
+    after = _annotate(CN.get(identifier))
+    _log_change(
+        "set_photo",
+        identifier,
+        {"has_image": before.get("has_image", False)},
+        {"has_image": True, "source": path, "bytes": len(data)},
+        "ok",
+    )
+    return json.dumps(
+        {"ok": True, "contact": _display_name(before), "bytes": len(data)}
+    )
 
 
 def create_group(name: str, container: str = "iCloud",
@@ -1122,11 +1316,20 @@ def move_to_container(identifier: str, container: str = "iCloud",
         k: v
         for k, v in before.items()
         if k in ("given_name", "middle_name", "family_name", "organization",
-                 "phones", "emails", "addresses") and v
+                 "job_title", "department", "nickname",
+                 "phones", "emails", "addresses",
+                 "urls", "social_profiles") and v
     }
     if before.get("note"):
         fields["note"] = before["note"]
     new_id = CN.create(fields, target["id"])
+    if before.get("has_image"):
+        try:
+            data = CN.photo(identifier)
+            if data:
+                CN.set_image(new_id, data)
+        except Exception:
+            pass  # a card without its photo beats a failed move
     target_groups = {g["id"] for g in CN.groups(target["id"])}
     kept, dropped = [], []
     for g in old_groups:
@@ -1216,12 +1419,14 @@ for _fn in (
     authorization_status,
     list_contacts,
     get_contact,
+    me_card,
     linked_cards,
     find_duplicates,
     export_contacts,
     create_contact,
     update_contact,
     delete_contact,
+    set_photo,
     create_group,
     add_to_group,
     remove_from_group,

@@ -69,9 +69,17 @@ fed the join.
 | `create_contact(fields, container="iCloud", confirm)` | New card in an explicit container. |
 | `update_contact(identifier, fields, confirm)` | Replace the given fields on a card. |
 | `delete_contact(identifier, confirm)` | Delete a card permanently. |
+| `me_card()` | The owner's own "me" contact, fully annotated — no guessing which card is the owner. |
+| `set_photo(identifier, path, confirm)` | Set a card's photo from a local JPEG/PNG, downscaled to ≤1024px on the long side before saving. |
 | `create_group(name, container="iCloud", confirm)` / `add_to_group` / `remove_from_group` | Group management. |
 | `move_to_container(identifier, "iCloud", confirm)` | Copy the card into the target account with all fields, re-add group memberships that exist there, then delete the source card. |
 | `merge_contacts(identifiers[], keep, confirm)` | Union of phones/emails/addresses/notes/groups onto the kept card, delete the rest, return the merged card. |
+
+Card fields cover names, organization, `job_title`, `department`,
+`nickname`, `note`, `phones`/`emails`/`urls` as `{label, value}` lists,
+`addresses` as `{label, street, city, state, postal_code, country}`,
+`social_profiles` as `{service, username, url}`, and `has_image` (with
+`get_contact(..., include_photo=true)` returning a `photo_path` temp file).
 
 Cards that CNContactStore presents as unified (linked) contacts are labeled
 `"container": "linked"` with their per-account pieces listed; write tools

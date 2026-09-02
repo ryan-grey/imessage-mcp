@@ -37,6 +37,8 @@ class FakeCN:
         ]
         self.groups_list = []  # {id, name, container_id}
         self.members = {}      # group id -> set of card ids
+        self.images = {}       # card id -> photo bytes
+        self.me_id = None
 
     def _new_id(self, prefix):
         self._seq += 1
@@ -51,9 +53,7 @@ class FakeCN:
         no container. pieces: [(fields, container_id), ...]."""
         pids = [self.create(f, cid) for f, cid in pieces]
         uid = self._new_id("UNIFIED")
-        card = {"identifier": uid, "given_name": "", "middle_name": "",
-                "family_name": "", "organization": "", "phones": [],
-                "emails": [], "addresses": [], "note": None}
+        card = {"identifier": uid, **self.BLANK}
         card.update(unified_fields)
         card["identifier"] = uid
         self.unified[uid] = card
@@ -112,12 +112,17 @@ class FakeCN:
     def group_member_ids(self, group_id):
         return sorted(self.members.get(group_id, set()))
 
+    BLANK = {"given_name": "", "middle_name": "", "family_name": "",
+             "organization": "", "job_title": "", "department": "",
+             "nickname": "", "phones": [], "emails": [], "addresses": [],
+             "urls": [], "social_profiles": [], "has_image": False,
+             "note": None}
+
     def create(self, fields, container_id):
         ident = self._new_id("CARD")
-        card = {"identifier": ident, "given_name": "", "middle_name": "",
-                "family_name": "", "organization": "", "phones": [],
-                "emails": [], "addresses": [], "note": None}
+        card = {"identifier": ident, **self.BLANK}
         card.update(fields)
+        card["identifier"] = ident
         self.cards[ident] = card
         self.card_container[ident] = container_id
         return ident
@@ -152,6 +157,16 @@ class FakeCN:
 
     def authorization_status(self):
         return 3  # authorized
+
+    def photo(self, identifier):
+        return self.images.get(identifier)
+
+    def set_image(self, identifier, data):
+        self.images[identifier] = bytes(data)
+        self.cards[identifier]["has_image"] = True
+
+    def me_card(self):
+        return dict(self.cards[self.me_id]) if self.me_id else None
 
     def vcard_export(self, container_id=None):
         cards = self.fetch(container_id=container_id)
@@ -533,6 +548,117 @@ def test_safe_wrapper_surfaces_real_errors():
     assert "CNAuthorizationStatusDenied" in out["error"]
     assert out["error"].startswith("RuntimeError:")
     assert json.loads(contacts._safe(lambda: '{"ok": true}')()) == {"ok": True}
+
+
+def _make_png(w, h):
+    import struct
+    import zlib
+
+    def chunk(tag, data):
+        body = tag + data
+        return (struct.pack(">I", len(data)) + body
+                + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF))
+
+    raw = b"".join(b"\x00" + b"\x80" * w for _ in range(h))
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 0, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw))
+            + chunk(b"IEND", b""))
+
+
+def _png_size(data):
+    import struct
+
+    return struct.unpack(">II", data[16:24])
+
+
+def test_extended_fields_roundtrip():
+    fake, a, b, c, gid = fresh()
+    fields = {
+        "given_name": "Robin", "family_name": "Builder",
+        "job_title": "AI & Cloud Operations", "nickname": "Rob",
+        "department": "Ops",
+        "urls": [{"label": "homepage", "value": "https://example.dev"},
+                 {"label": "GitHub", "value": "https://github.com/example"}],
+        "social_profiles": [{"service": "GitHub", "username": "example",
+                             "url": "https://github.com/example"}],
+    }
+    out = json.loads(contacts.create_contact(fields, confirm=True))
+    card = out["contact"]
+    assert card["job_title"] == "AI & Cloud Operations"
+    assert card["nickname"] == "Rob" and card["department"] == "Ops"
+    assert card["urls"][1] == {"label": "GitHub",
+                               "value": "https://github.com/example"}
+    assert card["social_profiles"][0]["service"] == "GitHub"
+    out = json.loads(contacts.update_contact(
+        card["identifier"], {"job_title": "Owner"}, confirm=True))
+    assert out["contact"]["job_title"] == "Owner"
+    exported = json.loads(contacts.export_contacts(
+        path=os.path.join(_TMP, "backups-fields")))
+    doc = json.load(open(exported["json"], encoding="utf-8"))
+    robin = next(x for x in doc["contacts"]
+                 if x["identifier"] == card["identifier"])
+    assert robin["job_title"] == "Owner"
+    assert robin["urls"] and robin["social_profiles"]
+
+
+def test_merge_unions_urls_and_social_profiles():
+    fake, a, b, c, gid = fresh()
+    fake.update(a, {"urls": [{"label": "homepage",
+                              "value": "https://example.dev"}]})
+    fake.update(c, {"urls": [{"label": "work",
+                              "value": "HTTPS://EXAMPLE.DEV"},  # dupe, case
+                             {"label": "blog",
+                              "value": "https://blog.example.dev"}],
+                    "social_profiles": [{"service": "GitHub",
+                                         "username": "example", "url": ""}]})
+    out = json.loads(contacts.merge_contacts([a, c], keep=a, confirm=True))
+    merged = out["contact"]
+    assert [u["value"] for u in merged["urls"]] == [
+        "https://example.dev", "https://blog.example.dev"]
+    assert merged["social_profiles"][0]["username"] == "example"
+
+
+def test_set_photo():
+    fake, a, b, c, gid = fresh()
+    big = os.path.join(_TMP, "big.png")
+    with open(big, "wb") as f:
+        f.write(_make_png(2048, 512))
+    out = json.loads(contacts.set_photo(a, big))
+    assert out["ok"] is False and "confirm" in out["error"]
+    txt = os.path.join(_TMP, "not-an-image.txt")
+    with open(txt, "w") as f:
+        f.write("plain text")
+    out = json.loads(contacts.set_photo(a, txt, confirm=True))
+    assert out["ok"] is False and "not a JPEG or PNG" in out["error"]
+    out = json.loads(contacts.set_photo(a, big, confirm=True))
+    assert out["ok"] is True
+    w, h = _png_size(fake.images[a])
+    assert max(w, h) <= 1024 and w > h  # downscaled, aspect kept
+    small = os.path.join(_TMP, "small.png")
+    with open(small, "wb") as f:
+        f.write(_make_png(300, 300))
+    out = json.loads(contacts.set_photo(c, small, confirm=True))
+    assert out["ok"] and fake.images[c] == open(small, "rb").read()  # untouched
+    got = json.loads(contacts.get_contact(identifier=c, include_photo=True))
+    assert got["has_image"] is True
+    assert os.path.isfile(got["photo_path"])
+    assert open(got["photo_path"], "rb").read() == fake.images[c]
+    log = [json.loads(l) for l in
+           open(os.environ["CONTACTS_CHANGES_LOG"], encoding="utf-8")]
+    photo_lines = [l for l in log if l["tool"] == "set_photo"]
+    assert photo_lines[-1]["before"] == {"has_image": False}
+    assert photo_lines[-1]["after"]["source"] == small
+
+
+def test_me_card():
+    fake, a, b, c, gid = fresh()
+    out = json.loads(contacts.me_card())
+    assert "no 'me' card" in out["error"]
+    fake.me_id = a
+    out = json.loads(contacts.me_card())
+    assert out["identifier"] == a
+    assert out["name"] == "Alex Fixture" and out["container"] == "iCloud"
 
 
 def test_helpers():
