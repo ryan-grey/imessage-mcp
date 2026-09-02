@@ -1,0 +1,145 @@
+"""Tests against a fully synthetic chat.db. Runs under pytest or plainly:
+
+    python3 tests/test_server.py
+"""
+
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+TESTS = Path(__file__).resolve().parent
+sys.path.insert(0, str(TESTS))
+sys.path.insert(0, str(TESTS.parent))
+
+import make_fixture
+
+_TMP = tempfile.mkdtemp(prefix="imessage-mcp-test-")
+_FIXTURE = os.path.join(_TMP, "fixture-chat.db")
+make_fixture.build(_FIXTURE)
+os.environ["IMESSAGE_CHAT_DB"] = _FIXTURE
+os.environ["IMESSAGE_INDEX_DB"] = os.path.join(_TMP, "index.db")
+os.environ["IMESSAGE_SENT_LOG"] = os.path.join(_TMP, "sent.log")
+
+import server  # noqa: E402  (env must be set before this import)
+
+
+def test_decode_short_and_long():
+    assert server._decode_attributed(
+        make_fixture.typedstream_blob("hello there")
+    ) == "hello there"
+    long = "y" * 5000
+    assert server._decode_attributed(make_fixture.typedstream_blob(long)) == long
+    assert server._decode_attributed(None) is None
+    assert server._decode_attributed(b"garbage with no marker") is None
+
+
+def test_time_roundtrip():
+    ns = make_fixture.apple_ns("2026-08-01T10:00:00+00:00")
+    iso = server._ts(ns)
+    assert iso.startswith("2026-08-01") or iso.startswith("2026-07-31")
+    assert server._apple("2026-08-01T10:00:00+00:00") == ns
+
+
+def test_search_finds_decoded_bodies():
+    out = json.loads(server.search_messages("pizza"))
+    assert out["count"] == 2
+    bodies = {m["body"] for m in out["messages"]}
+    assert "pizza on friday at seven?" in bodies
+    assert all(m["body"] for m in out["messages"])  # decoded, not empty
+    # newest first
+    assert out["messages"][0]["from_me"] is True
+
+
+def test_search_filters():
+    assert json.loads(server.search_messages("pizza", contact="0001111"))["count"] == 2
+    assert json.loads(server.search_messages("pizza", contact="0002222"))["count"] == 0
+    assert json.loads(server.search_messages("hello", chat_id="Fixture Group"))["count"] == 1
+    assert json.loads(
+        server.search_messages("pizza", since="2026-08-02T00:00:00+00:00")
+    )["count"] == 2
+    assert json.loads(
+        server.search_messages("pizza", until="2026-08-01T23:59:00+00:00")
+    )["count"] == 0
+
+
+def test_list_chats():
+    out = json.loads(server.list_chats())
+    assert out["count"] == 2
+    byname = {c["name"]: c for c in out["chats"]}
+    group = byname["Fixture Group"]
+    assert set(group["participants"]) == {"+15550002222", "fixture@example.com"}
+    assert group["unread"] == 2
+    assert group["last_preview"].startswith("long one:")
+    one = byname["+15550001111"]
+    assert one["unread"] == 0
+    assert one["last_time"] is not None
+
+
+def test_get_thread_by_handle_and_chat():
+    out = json.loads(server.get_thread(handle="+15550001111"))
+    assert out["count"] == 5
+    times = [m["time"] for m in out["messages"]]
+    assert times == sorted(times)  # oldest first
+    assert out["messages"][0]["body"] == "plain text only, no blob"
+    att = out["messages"][-1]
+    assert att["attachments"] == [
+        {"name": "photo.heic", "path": "/synthetic/path/photo.heic"}
+    ]
+    assert att["body"] == ""  # U+FFFC placeholder stripped
+
+    grp = json.loads(server.get_thread(chat_id="iMessage;+;chat00000fixture"))
+    assert grp["count"] == 2
+    assert grp["messages"][0]["sender"] == "+15550002222"
+
+    assert "error" in json.loads(server.get_thread(chat_id="nope"))
+    assert "error" in json.loads(server.get_thread())
+
+
+def test_get_contact_handles_falls_back_to_chat_db():
+    # No AddressBook in the test environment -> handle fallback.
+    out = json.loads(server.get_contact_handles("fixture"))
+    assert any(h["handle"] == "fixture@example.com" for h in out["handles"])
+
+
+def test_index_status():
+    out = json.loads(server.index_status())
+    assert out["counts"]["message"] == 7
+    assert out["attributed_body_decoding"]["working"] is True
+    assert out["newest_message"] is not None
+
+
+def test_send_refuses_without_confirm():
+    out = json.loads(server.send_message("+15550001111", "hi"))
+    assert out["sent"] is False and "confirm" in out["error"]
+    assert not os.path.exists(os.environ["IMESSAGE_SENT_LOG"])
+    out = json.loads(server.send_message("", "hi", confirm=True))
+    assert out["sent"] is False
+    out = json.loads(
+        server.send_message("+15550001111", "hi", attachment_path="/no/file",
+                            confirm=True)
+    )
+    assert out["sent"] is False and "no such file" in out["error"]
+
+
+def test_send_target_resolution():
+    assert server._resolve_send_target("iMessage;+;chatX") == (
+        "iMessage;+;chatX", True)
+    assert server._resolve_send_target("chat00000fixture") == (
+        "iMessage;+;chat00000fixture", True)
+    assert server._resolve_send_target("+15550001111") == (
+        "+15550001111", False)
+
+
+if __name__ == "__main__":
+    fails = 0
+    for name, fn in sorted(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            try:
+                fn()
+                print(f"ok    {name}")
+            except AssertionError as e:
+                fails += 1
+                print(f"FAIL  {name}: {e}")
+    sys.exit(1 if fails else 0)
