@@ -660,6 +660,13 @@ def _annotate(card):
                 }
                 for p in pieces
             ]
+        elif len(pieces) == 1:
+            # A unified id that differs from its lone underlying card
+            # (residue of past linking): resolve through the piece.
+            card["container"] = _account_label(
+                CN.container_of(pieces[0]["identifier"])
+            )
+            card["piece_identifier"] = pieces[0]["identifier"]
         else:
             card["container"] = None
     else:
@@ -936,6 +943,12 @@ def export_contacts(container: str = "", path: str = "") -> str:
             if len(pieces) > 1:
                 doc["container"] = "linked"
                 doc["linked_pieces"] = [_card_doc(p) for p in pieces]
+            elif len(pieces) == 1:
+                lone = CN.container_of(pieces[0]["identifier"])
+                doc["container"] = (
+                    {**lone, "account": _account_label(lone)} if lone else None
+                )
+                doc["piece_identifier"] = pieces[0]["identifier"]
         return doc
 
     docs = [_card_doc(c) for c in cards]
