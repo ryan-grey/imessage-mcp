@@ -1,9 +1,15 @@
 # imessage-mcp
 
-A local [MCP](https://modelcontextprotocol.io) server that gives the Claude
-desktop app read and send access to Apple Messages on your Mac. Search your
-message history, list chats, read threads, resolve contact names to handles,
-and send iMessages — all locally, with no network calls.
+Local [MCP](https://modelcontextprotocol.io) servers that give the Claude
+desktop app access to Apple Messages and Apple Contacts on your Mac — all
+locally, with no network calls.
+
+- **`server.py` (iMessage)** — search your message history, list chats, read
+  threads, resolve contact names to handles, and send iMessages.
+- **`contacts.py` (Contacts)** — list, search, deduplicate, create, update,
+  merge, group, and move contacts between accounts, through Apple's
+  Contacts.framework (CNContactStore) — never by touching the AddressBook
+  database files directly.
 
 ## What it does
 
@@ -40,6 +46,38 @@ handles are joined to contact names everywhere they appear — `sender_name`
 on messages, names on chat participants, and 1:1 chats titled by contact
 instead of raw number.
 
+## Contacts tools (`contacts.py`)
+
+| Tool | What it does |
+| --- | --- |
+| `list_contacts(query?, container?, group?, limit=100)` | Contacts with name, org, phones, emails, addresses, notes, account (iCloud/Google/local), and group memberships. |
+| `get_contact(identifier \| name)` | One fully annotated card; an ambiguous name returns the candidates. |
+| `find_duplicates(strategy)` | Clusters sharing a phone, email, or normalized name, with the fields that differ between the cards. |
+| `create_contact(fields, container="iCloud", confirm)` | New card in an explicit container. |
+| `update_contact(identifier, fields, confirm)` | Replace the given fields on a card. |
+| `delete_contact(identifier, confirm)` | Delete a card permanently. |
+| `create_group(name, container="iCloud", confirm)` / `add_to_group` / `remove_from_group` | Group management. |
+| `move_to_container(identifier, "iCloud", confirm)` | Copy the card into the target account with all fields, re-add group memberships that exist there, then delete the source card. |
+| `merge_contacts(identifiers[], keep, confirm)` | Union of phones/emails/addresses/notes/groups onto the kept card, delete the rest, return the merged card. |
+
+Contacts safety rules:
+
+- **Every write tool refuses unless `confirm` is `true`**, and every change
+  is appended to `contacts-changes.log` (in this directory, gitignored)
+  with the full before/after card.
+- The iCloud container is resolved **structurally** — the CardDAV container
+  Apple names `Card` — never as "the default account", so an iCloud-targeted
+  card can never silently land in a Google account. If your setup is
+  ambiguous, pin it with `CONTACTS_ICLOUD_CONTAINER_ID`.
+- All access goes through Contacts.framework, the same path Contacts.app
+  uses. Nothing ever writes to the `AddressBook-v22.abcddb` SQLite files.
+- Changes propagate through iCloud exactly like edits made in Contacts.app.
+  Messages display names on your other devices update after Contacts has
+  been opened once there.
+- Contact **notes** require Apple's `com.apple.developer.contacts.notes`
+  entitlement, which normal processes don't have: without it the note field
+  reads as unavailable and note writes are refused cleanly.
+
 ## Install
 
 Requires macOS and Python 3.10+.
@@ -47,10 +85,13 @@ Requires macOS and Python 3.10+.
 ```sh
 git clone https://github.com/ryan-grey/imessage-mcp ~/Documents/imessage-mcp
 python3 -m venv ~/.local/imessage-mcp/.venv
-~/.local/imessage-mcp/.venv/bin/pip install mcp
+~/.local/imessage-mcp/.venv/bin/pip install mcp pyobjc-core pyobjc-framework-Contacts
 ```
 
-Then register it in the Claude desktop app's MCP config
+(`pyobjc-*` is only needed for the Contacts server; the iMessage server has
+no dependencies beyond `mcp`.)
+
+Then register them in the Claude desktop app's MCP config
 (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 
 ```json
@@ -59,16 +100,21 @@ Then register it in the Claude desktop app's MCP config
     "imessage": {
       "command": "/Users/YOU/.local/imessage-mcp/.venv/bin/python",
       "args": ["/Users/YOU/Documents/imessage-mcp/server.py"]
+    },
+    "contacts": {
+      "command": "/Users/YOU/.local/imessage-mcp/.venv/bin/python",
+      "args": ["/Users/YOU/Documents/imessage-mcp/contacts.py"]
     }
   }
 }
 ```
 
-Restart the Claude desktop app and the `imessage` tools appear.
+Restart the Claude desktop app and the `imessage` and `contacts` tools
+appear.
 
-## The two macOS permission grants
+## The macOS permission grants
 
-Nothing works until you grant these — both are manual, by Apple's design:
+Nothing works until you grant these — all are manual, by Apple's design:
 
 1. **Full Disk Access** for the process that runs the server. Open
    **System Settings → Privacy & Security → Full Disk Access** and add the
@@ -81,6 +127,11 @@ Nothing works until you grant these — both are manual, by Apple's design:
    `send_message` runs, macOS shows a prompt asking to allow the controlling
    app to control **Messages**. Click Allow. If you dismissed it, re-enable
    under **System Settings → Privacy & Security → Automation**.
+3. **Contacts** access, for the Contacts server. The first Contacts tool
+   call triggers the system prompt for the app that runs the server (the
+   Claude desktop app, or your terminal/python if run by hand). If you
+   dismissed it, re-enable under **System Settings → Privacy & Security →
+   Contacts**.
 
 Messages must be signed in to your Apple account for sending to work. The
 app can be closed — AppleScript launches it as needed.
@@ -90,17 +141,19 @@ app can be closed — AppleScript launches it as needed.
 - The message database is opened read-only and immutable; there is no code
   path that writes to anything under `~/Library/Messages`.
 - Everything is local. The server makes no network calls of any kind.
-- The FTS index (`index.db`) and send log (`sent.log`) live in this
-  directory, are gitignored, and never leave your machine. Delete them any
-  time; the index rebuilds on the next search.
-- Test fixtures are fully synthetic — generated by
-  `tests/make_fixture.py` — so the repository never contains real message
-  or contact data.
+- The FTS index (`index.db`), send log (`sent.log`), and contact change log
+  (`contacts-changes.log`) live in this directory, are gitignored, and never
+  leave your machine. Delete them any time; the index rebuilds on the next
+  search.
+- Test fixtures are fully synthetic — generated by `tests/make_fixture.py`
+  and an in-memory fake of the Contacts adapter — so the repository never
+  contains real message or contact data.
 
 ## Tests
 
 ```sh
 ~/.local/imessage-mcp/.venv/bin/python tests/test_server.py
+~/.local/imessage-mcp/.venv/bin/python tests/test_contacts.py
 ```
 
 ## License
