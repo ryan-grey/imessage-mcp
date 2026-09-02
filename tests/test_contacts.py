@@ -112,6 +112,17 @@ class FakeCN:
     def remove_member(self, identifier, group_id):
         self.members[group_id].discard(identifier)
 
+    def authorization_status(self):
+        return 3  # authorized
+
+    def vcard_export(self, container_id=None):
+        cards = self.fetch(container_id=container_id)
+        return "".join(
+            "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:"
+            + contacts._display_name(c) + "\r\nEND:VCARD\r\n"
+            for c in cards
+        ).encode("utf-8")
+
 
 def fresh():
     fake = FakeCN()
@@ -291,6 +302,62 @@ def test_group_tools():
     out = json.loads(contacts.remove_from_group(c, "New Circle", confirm=True))
     assert out["ok"]
     assert json.loads(contacts.get_contact(identifier=c))["groups"] == []
+
+
+def test_export_writes_vcf_and_json():
+    fake, a, b, c, gid = fresh()
+    outdir = os.path.join(_TMP, "backups")
+    log = os.environ["CONTACTS_CHANGES_LOG"]
+    lines_before = (
+        sum(1 for _ in open(log, encoding="utf-8"))
+        if os.path.exists(log) else 0
+    )
+    out = json.loads(contacts.export_contacts(path=outdir))
+    assert out["count"] == 3
+    assert os.path.isfile(out["vcf"]) and os.path.isfile(out["json"])
+    assert out["vcf"].endswith(".vcf") and out["json"].endswith(".json")
+    assert out["containers"] == {"iCloud": 2, "Google": 1}
+    assert out["bytes"]["vcf"] == os.path.getsize(out["vcf"])
+    vcf = open(out["vcf"], encoding="utf-8").read()
+    assert vcf.count("BEGIN:VCARD") == 3 and "Alex Fixture" in vcf
+    doc = json.load(open(out["json"], encoding="utf-8"))
+    assert len(doc["contacts"]) == 3
+    byid = {x["identifier"]: x for x in doc["contacts"]}
+    assert byid[a]["container"]["account"] == "iCloud"
+    assert byid[a]["container"]["id"] == "ICLOUD-1"
+    assert byid[a]["groups"] == [{"id": gid, "name": "Family"}]
+    assert byid[b]["container"]["account"] == "Google"
+    assert byid[b]["groups"] == []
+    assert {c["account"] for c in doc["containers"]} >= {"iCloud", "Google"}
+    assert doc["groups"][0]["name"] == "Family"
+    assert doc["groups"][0]["container_id"] == "ICLOUD-1"
+    lines = list(open(log, encoding="utf-8"))
+    assert len(lines) == lines_before + 1
+    last = json.loads(lines[-1])
+    assert last["tool"] == "export_contacts"
+    assert last["after"]["count"] == 3
+    # container-scoped export
+    out = json.loads(contacts.export_contacts(container="Google", path=outdir))
+    assert out["count"] == 1 and out["containers"] == {"Google": 1}
+    vcf = open(out["vcf"], encoding="utf-8").read()
+    assert vcf.count("BEGIN:VCARD") == 1
+
+
+def test_authorization_status():
+    fresh()
+    out = json.loads(contacts.authorization_status())
+    assert out["status"] == 3 and out["meaning"] == "authorized"
+    assert out["python"]
+
+
+def test_safe_wrapper_surfaces_real_errors():
+    def boom():
+        raise RuntimeError("CNAuthorizationStatusDenied: grant Contacts")
+
+    out = json.loads(contacts._safe(boom)())
+    assert "CNAuthorizationStatusDenied" in out["error"]
+    assert out["error"].startswith("RuntimeError:")
+    assert json.loads(contacts._safe(lambda: '{"ok": true}')()) == {"ok": True}
 
 
 def test_helpers():

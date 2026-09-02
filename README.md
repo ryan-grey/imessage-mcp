@@ -91,6 +91,13 @@ python3 -m venv ~/.local/imessage-mcp/.venv
 (`pyobjc-*` is only needed for the Contacts server; the iMessage server has
 no dependencies beyond `mcp`.)
 
+Note on the Contacts grant: macOS attributes it to the **app that launches
+the server**, not to the venv's python binary — so when the MCP desktop
+client spawns it, the client name is what appears (and must be enabled) under System
+Settings → Privacy & Security → Contacts; run it from a terminal and the
+grant belongs to the terminal app instead. The `authorization_status` tool
+reports the live state for whichever context the server is running in.
+
 Then register them in the MCP desktop client's MCP config
 (`<your MCP client configuration file>`):
 
