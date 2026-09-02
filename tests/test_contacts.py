@@ -456,6 +456,29 @@ def test_export_includes_linked_pieces():
     assert pieces[gg]["family_name"] == "Dotson"
 
 
+def test_single_piece_unified_resolves_through_its_piece():
+    # The real store holds unified ids that differ from their lone
+    # underlying card (residue of old links) - seen as 19 null-container
+    # cards on 2026-09-02, all single-piece iCloud underneath.
+    fake, a, b, c, gid = fresh()
+    uid, (pid,) = fake.seed_linked(
+        {"given_name": "Janet", "family_name": "Keys"},
+        [({"given_name": "Janet", "family_name": "Keys"}, "ICLOUD-1")],
+    )
+    out = json.loads(contacts.list_contacts(query="janet"))
+    card = out["contacts"][0]
+    assert card["container"] == "iCloud"
+    assert card["piece_identifier"] == pid
+    assert "linked" not in card
+    exported = json.loads(contacts.export_contacts(
+        path=os.path.join(_TMP, "backups-single")))
+    doc = json.load(open(exported["json"], encoding="utf-8"))
+    unified = next(x for x in doc["contacts"] if x["identifier"] == uid)
+    assert unified["container"]["account"] == "iCloud"
+    assert unified["piece_identifier"] == pid
+    assert exported["containers"] == {"iCloud": 3, "Google": 1}
+
+
 def test_export_writes_vcf_and_json():
     fake, a, b, c, gid = fresh()
     outdir = os.path.join(_TMP, "backups")
