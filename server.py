@@ -204,9 +204,123 @@ def _shape(con, rows):
 # ---------------------------------------------------------------- contacts --
 
 
+def _cn_authorized():
+    """True when Contacts.framework is importable AND this process already
+    holds the Contacts grant. Never triggers the permission prompt."""
+    if os.environ.get("IMESSAGE_NAME_SOURCE") == "sqlite":
+        return False
+    try:
+        import Contacts as C
+    except ImportError:
+        return False
+    return int(
+        C.CNContactStore.authorizationStatusForEntityType_(
+            C.CNEntityTypeContacts
+        )
+    ) in (3, 4)  # authorized / limited
+
+
+def _framework_contacts():
+    """(rows, unified card count) via CNContactStore - the same unified
+    view Contacts.app shows, immune to stale or foreign AddressBook
+    sources on disk. None when the framework or grant is unavailable."""
+    if not _cn_authorized():
+        return None
+    try:
+        import Contacts as C
+
+        store = C.CNContactStore.alloc().init()
+        keys = [
+            C.CNContactGivenNameKey,
+            C.CNContactFamilyNameKey,
+            C.CNContactOrganizationNameKey,
+            C.CNContactPhoneNumbersKey,
+            C.CNContactEmailAddressesKey,
+        ]
+        rows, cards = [], 0
+
+        def visit(c, stop):
+            nonlocal cards
+            cards += 1
+            name = " ".join(
+                p
+                for p in (str(c.givenName() or ""), str(c.familyName() or ""))
+                if p
+            ) or str(c.organizationName() or "").strip()
+            if not name:
+                return
+            for lv in c.phoneNumbers():
+                rows.append((name, "phone", str(lv.value().stringValue())))
+            for lv in c.emailAddresses():
+                rows.append((name, "email", str(lv.value())))
+
+        req = C.CNContactFetchRequest.alloc().initWithKeysToFetch_(keys)
+        ok, _err = store.enumerateContactsWithFetchRequest_error_usingBlock_(
+            req, None, visit
+        )
+        if not ok:
+            return None
+        return rows, cards
+    except Exception:
+        return None
+
+
+def _framework_owner_name():
+    """The owner's name from the Contacts 'me card', when available."""
+    if not _cn_authorized():
+        return None
+    try:
+        import Contacts as C
+
+        store = C.CNContactStore.alloc().init()
+        me, _err = store.unifiedMeContactWithKeysToFetch_error_(
+            [C.CNContactGivenNameKey, C.CNContactFamilyNameKey,
+             C.CNContactOrganizationNameKey],
+            None,
+        )
+        if me is None:
+            return None
+        return " ".join(
+            p
+            for p in (str(me.givenName() or ""), str(me.familyName() or ""))
+            if p
+        ) or str(me.organizationName() or "").strip() or None
+    except Exception:
+        return None
+
+
+def _sqlite_sources():
+    """Candidate AddressBook databases for the SQLite fallback: the
+    per-account stores under Sources/, newest first, so an actively
+    syncing book outranks a stale one; the pre-Sources root store is
+    used only when no Sources db exists at all (it is legacy data and
+    on this machine held a different family member's labels)."""
+    paths = [Path(p) for p in glob.glob(ADDRESSBOOK_GLOB, recursive=True)]
+    in_sources = [p for p in paths if p.parent.parent.name == "Sources"]
+    chosen = in_sources or paths
+
+    def mtime(p):
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0
+
+    return sorted(chosen, key=mtime, reverse=True)
+
+
 def _addressbook_rows():
-    """(name, kind, value) for every phone/email in every readable
-    AddressBook source. Returns (rows, readable)."""
+    """(name, kind, value) rows for the handle->name join, plus a source
+    report stashed in _CONTACTS['source'] for index_status. Prefers
+    Contacts.framework; falls back to reading the AddressBook SQLite.
+    Returns (rows, readable)."""
+    fw = _framework_contacts()
+    if fw is not None:
+        rows, cards = fw
+        _CONTACTS["source"] = {
+            "via": "Contacts.framework (CNContactStore, unified)",
+            "cards": cards,
+        }
+        return rows, True
     query = """
         SELECT r.ZFIRSTNAME AS first, r.ZLASTNAME AS last,
                r.ZORGANIZATION AS org,
@@ -219,8 +333,8 @@ def _addressbook_rows():
         FROM ZABCDRECORD r
         JOIN ZABCDEMAILADDRESS e ON e.ZOWNER = r.Z_PK
     """
-    rows, readable = [], False
-    for db in sorted(glob.glob(ADDRESSBOOK_GLOB, recursive=True)):
+    rows, files = [], []
+    for db in _sqlite_sources():
         # mode=ro first, NOT immutable: the AddressBook runs in WAL mode,
         # and a rename synced from iCloud sits in the WAL until Contacts
         # checkpoints - immutable=1 skips the WAL and serves the stale
@@ -243,7 +357,7 @@ def _addressbook_rows():
             break
         if got is None:
             continue
-        readable = True
+        kept = 0
         for r in got:
             # Organization-only cards (schools, businesses) have no
             # first/last name - the org name is their name.
@@ -252,7 +366,15 @@ def _addressbook_rows():
             ).strip()
             if name and r["value"]:
                 rows.append((name, r["kind"], r["value"]))
-    return rows, readable
+                kept += 1
+        files.append({"path": str(db), "rows": kept})
+    _CONTACTS["source"] = (
+        {"via": "AddressBook SQLite fallback (newest source wins)",
+         "files": files}
+        if files
+        else None
+    )
+    return rows, bool(files)
 
 
 def _norm_handle(h):
@@ -266,7 +388,7 @@ def _norm_handle(h):
     return digits[-10:] if len(digits) >= 7 else digits
 
 
-_CONTACTS = {"at": 0.0, "map": {}}
+_CONTACTS = {"at": 0.0, "map": {}, "source": None}
 
 
 def _contact_map():
@@ -311,6 +433,8 @@ def _owner_name():
     if time.time() - _OWNER["at"] > 300:
         _OWNER["at"] = time.time()
         name = os.environ.get("IMESSAGE_OWNER_NAME")
+        if not name:
+            name = _framework_owner_name()  # the Contacts 'me card'
         if not name:
             try:
                 con = _chat_db()
@@ -617,6 +741,7 @@ def index_status() -> str:
         )
     finally:
         con.close()
+    mapping = _contact_map()
     status = {
         "chat_db": str(CHAT_DB),
         "counts": counts,
@@ -625,6 +750,9 @@ def index_status() -> str:
             "working": decoded > 0 or not sample,
             "decoded": f"{decoded}/{len(sample)} recent blobs",
         },
+        "contacts_source": _CONTACTS["source"],
+        "contacts_mapped": len(mapping),
+        "owner_name": _owner_name(),
     }
     if INDEX_DB.exists():
         ix = _index_con()

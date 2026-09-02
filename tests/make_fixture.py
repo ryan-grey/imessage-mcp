@@ -110,21 +110,36 @@ def build(path):
     con.close()
 
 
+AB_SCHEMA = """
+    CREATE TABLE ZABCDRECORD (Z_PK INTEGER PRIMARY KEY, ZFIRSTNAME TEXT,
+                              ZLASTNAME TEXT, ZORGANIZATION TEXT);
+    CREATE TABLE ZABCDPHONENUMBER (Z_PK INTEGER PRIMARY KEY,
+                                   ZOWNER INTEGER, ZFULLNUMBER TEXT);
+    CREATE TABLE ZABCDEMAILADDRESS (Z_PK INTEGER PRIMARY KEY,
+                                    ZOWNER INTEGER, ZADDRESS TEXT);
+"""
+
+
+def build_addressbook_min(path, entries):
+    """A minimal synthetic AddressBook source: entries are
+    (first, last, org, phone) tuples, all invented."""
+    con = sqlite3.connect(path)
+    con.executescript(AB_SCHEMA)
+    for i, (first, last, org, phone) in enumerate(entries, 1):
+        con.execute("INSERT INTO ZABCDRECORD VALUES (?,?,?,?)",
+                    (i, first, last, org))
+        con.execute("INSERT INTO ZABCDPHONENUMBER VALUES (?,?,?)",
+                    (i, i, phone))
+    con.commit()
+    con.close()
+
+
 def build_addressbook(path):
     """A synthetic AddressBook-v22.abcddb with just the tables we read.
     'Alex Fixture' owns the +1 555 000 1111 number formatted the way macOS
     stores it - with punctuation - to exercise handle normalization."""
     con = sqlite3.connect(path)
-    con.executescript(
-        """
-        CREATE TABLE ZABCDRECORD (Z_PK INTEGER PRIMARY KEY, ZFIRSTNAME TEXT,
-                                  ZLASTNAME TEXT, ZORGANIZATION TEXT);
-        CREATE TABLE ZABCDPHONENUMBER (Z_PK INTEGER PRIMARY KEY,
-                                       ZOWNER INTEGER, ZFULLNUMBER TEXT);
-        CREATE TABLE ZABCDEMAILADDRESS (Z_PK INTEGER PRIMARY KEY,
-                                        ZOWNER INTEGER, ZADDRESS TEXT);
-        """
-    )
+    con.executescript(AB_SCHEMA)
     con.executemany(
         "INSERT INTO ZABCDRECORD VALUES (?,?,?,?)",
         [(1, "Alex", "Fixture", None), (2, "Blake", "Sample", None),
