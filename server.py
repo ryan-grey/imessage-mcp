@@ -190,7 +190,8 @@ def _shape(con, rows):
             "time": _ts(r["date"]),
             "from_me": bool(r["is_from_me"]),
             "sender": "me" if r["is_from_me"] else (r["handle"] or "unknown"),
-            "sender_name": None if r["is_from_me"] else _name_for(r["handle"]),
+            "sender_name": _owner_name() if r["is_from_me"]
+            else _name_for(r["handle"]),
             "chat_id": r["chat_guid"],
             "chat_name": _name_for(r["chat_name"]) or r["chat_name"],
             "body": _body(r["text"], r["attributedBody"]),
@@ -206,31 +207,41 @@ def _shape(con, rows):
 def _addressbook_rows():
     """(name, kind, value) for every phone/email in every readable
     AddressBook source. Returns (rows, readable)."""
+    query = """
+        SELECT r.ZFIRSTNAME AS first, r.ZLASTNAME AS last,
+               p.ZFULLNUMBER AS value, 'phone' AS kind
+        FROM ZABCDRECORD r
+        JOIN ZABCDPHONENUMBER p ON p.ZOWNER = r.Z_PK
+        UNION ALL
+        SELECT r.ZFIRSTNAME, r.ZLASTNAME, e.ZADDRESS, 'email'
+        FROM ZABCDRECORD r
+        JOIN ZABCDEMAILADDRESS e ON e.ZOWNER = r.Z_PK
+    """
     rows, readable = [], False
     for db in sorted(glob.glob(ADDRESSBOOK_GLOB, recursive=True)):
-        try:
-            con = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True)
-            con.row_factory = sqlite3.Row
-            got = con.execute(
-                """
-                SELECT r.ZFIRSTNAME AS first, r.ZLASTNAME AS last,
-                       p.ZFULLNUMBER AS value, 'phone' AS kind
-                FROM ZABCDRECORD r
-                JOIN ZABCDPHONENUMBER p ON p.ZOWNER = r.Z_PK
-                UNION ALL
-                SELECT r.ZFIRSTNAME, r.ZLASTNAME, e.ZADDRESS, 'email'
-                FROM ZABCDRECORD r
-                JOIN ZABCDEMAILADDRESS e ON e.ZOWNER = r.Z_PK
-                """
-            ).fetchall()
-            readable = True
-        except sqlite3.Error:
-            continue
-        finally:
+        # mode=ro first, NOT immutable: the AddressBook runs in WAL mode,
+        # and a rename synced from iCloud sits in the WAL until Contacts
+        # checkpoints - immutable=1 skips the WAL and serves the stale
+        # checkpointed name. Plain ro reads it live (briefly taking shared
+        # locks, which Contacts tolerates); immutable stays as fallback
+        # for setups where the -wal/-shm sidecars are unreadable.
+        got = None
+        for uri in (f"file:{db}?mode=ro", f"file:{db}?mode=ro&immutable=1"):
             try:
+                con = sqlite3.connect(uri, uri=True)
+            except sqlite3.Error:
+                continue
+            try:
+                con.row_factory = sqlite3.Row
+                got = con.execute(query).fetchall()
+            except sqlite3.Error:
+                continue
+            finally:
                 con.close()
-            except Exception:
-                pass
+            break
+        if got is None:
+            continue
+        readable = True
         for r in got:
             name = " ".join(p for p in (r["first"], r["last"]) if p)
             if name and r["value"]:
@@ -265,6 +276,38 @@ def _contact_map():
 
 def _name_for(handle):
     return _contact_map().get(_norm_handle(handle))
+
+
+_OWNER = {"at": 0.0, "name": None}
+
+
+def _owner_name():
+    """The owner's contact name for from_me rows: the Messages account
+    handles (message.account, e.g. 'E:you@icloud.com') pushed through the
+    same AddressBook join. IMESSAGE_OWNER_NAME overrides; None when the
+    owner has no card of their own."""
+    if time.time() - _OWNER["at"] > 300:
+        _OWNER["at"] = time.time()
+        name = os.environ.get("IMESSAGE_OWNER_NAME")
+        if not name:
+            try:
+                con = _chat_db()
+                try:
+                    rows = con.execute(
+                        "SELECT DISTINCT account FROM message "
+                        "WHERE is_from_me = 1 AND account IS NOT NULL "
+                        "LIMIT 20"
+                    ).fetchall()
+                finally:
+                    con.close()
+                for r in rows:
+                    name = _name_for(re.sub(r"^[EePp]:", "", r["account"]))
+                    if name:
+                        break
+            except Exception:
+                name = None
+        _OWNER["name"] = name
+    return _OWNER["name"]
 
 
 # ------------------------------------------------------------------- index --
@@ -365,7 +408,8 @@ def search_messages(
                 "time": _ts(r["date"]),
                 "from_me": bool(r["from_me"]),
                 "sender": "me" if r["from_me"] else (r["handle"] or "unknown"),
-                "sender_name": None if r["from_me"] else _name_for(r["handle"]),
+                "sender_name": _owner_name() if r["from_me"]
+                else _name_for(r["handle"]),
                 "chat_id": r["chat_guid"],
                 "chat_name": _name_for(r["chat_name"]) or r["chat_name"],
                 "body": r["body"],
@@ -522,6 +566,17 @@ def get_contact_handles(name: str) -> str:
     )
 
 
+def refresh_contacts() -> str:
+    """Rebuild the handle->name map from the AddressBook right now - it
+    otherwise caches for five minutes. Use after a contact is renamed."""
+    _CONTACTS["at"] = 0.0
+    _OWNER["at"] = 0.0
+    mapping = _contact_map()
+    return json.dumps(
+        {"contacts_mapped": len(mapping), "owner_name": _owner_name()}
+    )
+
+
 def index_status() -> str:
     """Row counts, newest message time, and attributedBody decode health."""
     con = _chat_db()
@@ -674,6 +729,7 @@ for _fn in (
     list_chats,
     get_thread,
     get_contact_handles,
+    refresh_contacts,
     index_status,
     send_message,
 ):

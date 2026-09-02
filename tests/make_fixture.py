@@ -43,7 +43,7 @@ CREATE TABLE chat (ROWID INTEGER PRIMARY KEY, guid TEXT, chat_identifier TEXT,
 CREATE TABLE message (ROWID INTEGER PRIMARY KEY, guid TEXT, text TEXT,
                       attributedBody BLOB, handle_id INTEGER, date INTEGER,
                       is_from_me INTEGER DEFAULT 0, is_read INTEGER DEFAULT 1,
-                      cache_has_attachments INTEGER DEFAULT 0);
+                      cache_has_attachments INTEGER DEFAULT 0, account TEXT);
 CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER,
                                 message_date INTEGER);
 CREATE TABLE chat_handle_join (chat_id INTEGER, handle_id INTEGER);
@@ -92,10 +92,11 @@ def build(path):
         date = apple_ns(iso)
         con.execute(
             "INSERT INTO message (ROWID, guid, text, attributedBody, handle_id,"
-            " date, is_from_me, is_read, cache_has_attachments)"
-            " VALUES (?,?,?,?,?,?,?,?,?)",
+            " date, is_from_me, is_read, cache_has_attachments, account)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
             (rowid, f"MSG-{rowid}", text, blob, handle, date, from_me, is_read,
-             1 if rowid == 7 else 0),
+             1 if rowid == 7 else 0,
+             "E:owner@example.com" if from_me else None),
         )
         con.execute(
             "INSERT INTO chat_message_join VALUES (?,?,?)", (chat, rowid, date)
@@ -126,13 +127,15 @@ def build_addressbook(path):
     )
     con.executemany(
         "INSERT INTO ZABCDRECORD VALUES (?,?,?)",
-        [(1, "Alex", "Fixture"), (2, "Blake", "Sample")],
+        [(1, "Alex", "Fixture"), (2, "Blake", "Sample"),
+         (3, "Riley", "Owner")],  # the Mac owner's own card
     )
     con.execute(
         "INSERT INTO ZABCDPHONENUMBER VALUES (1, 1, '(555) 000-1111')"
     )
-    con.execute(
-        "INSERT INTO ZABCDEMAILADDRESS VALUES (1, 2, 'Fixture@Example.com')"
+    con.executemany(
+        "INSERT INTO ZABCDEMAILADDRESS VALUES (?,?,?)",
+        [(1, 2, "Fixture@Example.com"), (2, 3, "owner@example.com")],
     )
     con.commit()
     con.close()
