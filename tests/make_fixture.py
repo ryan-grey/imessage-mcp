@@ -118,7 +118,7 @@ def build_addressbook(path):
     con.executescript(
         """
         CREATE TABLE ZABCDRECORD (Z_PK INTEGER PRIMARY KEY, ZFIRSTNAME TEXT,
-                                  ZLASTNAME TEXT);
+                                  ZLASTNAME TEXT, ZORGANIZATION TEXT);
         CREATE TABLE ZABCDPHONENUMBER (Z_PK INTEGER PRIMARY KEY,
                                        ZOWNER INTEGER, ZFULLNUMBER TEXT);
         CREATE TABLE ZABCDEMAILADDRESS (Z_PK INTEGER PRIMARY KEY,
@@ -126,12 +126,18 @@ def build_addressbook(path):
         """
     )
     con.executemany(
-        "INSERT INTO ZABCDRECORD VALUES (?,?,?)",
-        [(1, "Alex", "Fixture"), (2, "Blake", "Sample"),
-         (3, "Riley", "Owner")],  # the Mac owner's own card
+        "INSERT INTO ZABCDRECORD VALUES (?,?,?,?)",
+        [(1, "Alex", "Fixture", None), (2, "Blake", "Sample", None),
+         (3, "Riley", "Owner", None),  # the Mac owner's own card
+         # Organization-only cards: no first/last name at all.
+         (4, None, None, "Synthetic Middle School"),
+         (5, None, None, "Fixture Charity")],
     )
-    con.execute(
-        "INSERT INTO ZABCDPHONENUMBER VALUES (1, 1, '(555) 000-1111')"
+    con.executemany(
+        "INSERT INTO ZABCDPHONENUMBER VALUES (?,?,?)",
+        [(1, 1, "(555) 000-1111"),
+         (2, 4, "(555) 460-0001"),
+         (3, 5, "460-3333")],  # local 7-digit format, no area code
     )
     con.executemany(
         "INSERT INTO ZABCDEMAILADDRESS VALUES (?,?,?)",
