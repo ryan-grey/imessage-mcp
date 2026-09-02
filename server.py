@@ -36,6 +36,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -46,8 +47,9 @@ CHAT_DB = Path(os.environ.get("IMESSAGE_CHAT_DB", HOME / "Library/Messages/chat.
 REPO_DIR = Path(__file__).resolve().parent
 INDEX_DB = Path(os.environ.get("IMESSAGE_INDEX_DB", REPO_DIR / "index.db"))
 SENT_LOG = Path(os.environ.get("IMESSAGE_SENT_LOG", REPO_DIR / "sent.log"))
-ADDRESSBOOK_GLOB = str(
-    HOME / "Library/Application Support/AddressBook/**/AddressBook-v22.abcddb"
+ADDRESSBOOK_GLOB = os.environ.get(
+    "IMESSAGE_ADDRESSBOOK_GLOB",
+    str(HOME / "Library/Application Support/AddressBook/**/AddressBook-v22.abcddb"),
 )
 
 # Apple stores message dates as nanoseconds since 2001-01-01 UTC.
@@ -188,13 +190,81 @@ def _shape(con, rows):
             "time": _ts(r["date"]),
             "from_me": bool(r["is_from_me"]),
             "sender": "me" if r["is_from_me"] else (r["handle"] or "unknown"),
+            "sender_name": None if r["is_from_me"] else _name_for(r["handle"]),
             "chat_id": r["chat_guid"],
-            "chat_name": r["chat_name"],
+            "chat_name": _name_for(r["chat_name"]) or r["chat_name"],
             "body": _body(r["text"], r["attributedBody"]),
             "attachments": att.get(r["rowid"], []),
         }
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------- contacts --
+
+
+def _addressbook_rows():
+    """(name, kind, value) for every phone/email in every readable
+    AddressBook source. Returns (rows, readable)."""
+    rows, readable = [], False
+    for db in sorted(glob.glob(ADDRESSBOOK_GLOB, recursive=True)):
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True)
+            con.row_factory = sqlite3.Row
+            got = con.execute(
+                """
+                SELECT r.ZFIRSTNAME AS first, r.ZLASTNAME AS last,
+                       p.ZFULLNUMBER AS value, 'phone' AS kind
+                FROM ZABCDRECORD r
+                JOIN ZABCDPHONENUMBER p ON p.ZOWNER = r.Z_PK
+                UNION ALL
+                SELECT r.ZFIRSTNAME, r.ZLASTNAME, e.ZADDRESS, 'email'
+                FROM ZABCDRECORD r
+                JOIN ZABCDEMAILADDRESS e ON e.ZOWNER = r.Z_PK
+                """
+            ).fetchall()
+            readable = True
+        except sqlite3.Error:
+            continue
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+        for r in got:
+            name = " ".join(p for p in (r["first"], r["last"]) if p)
+            if name and r["value"]:
+                rows.append((name, r["kind"], r["value"]))
+    return rows, readable
+
+
+def _norm_handle(h):
+    """Comparable key for a handle: lowercased email, or the last 10 digits
+    of a phone number (so '(423) 946-2258' matches '+14239462258')."""
+    if not h:
+        return None
+    if "@" in h:
+        return h.strip().lower()
+    digits = re.sub(r"\D", "", h)
+    return digits[-10:] if len(digits) >= 7 else digits
+
+
+_CONTACTS = {"at": 0.0, "map": {}}
+
+
+def _contact_map():
+    """normalized handle -> contact name, cached for five minutes."""
+    if time.time() - _CONTACTS["at"] > 300:
+        rows, _ = _addressbook_rows()
+        _CONTACTS["map"] = {
+            _norm_handle(value): name for name, _kind, value in rows
+        }
+        _CONTACTS["at"] = time.time()
+    return _CONTACTS["map"]
+
+
+def _name_for(handle):
+    return _contact_map().get(_norm_handle(handle))
 
 
 # ------------------------------------------------------------------- index --
@@ -295,8 +365,9 @@ def search_messages(
                 "time": _ts(r["date"]),
                 "from_me": bool(r["from_me"]),
                 "sender": "me" if r["from_me"] else (r["handle"] or "unknown"),
+                "sender_name": None if r["from_me"] else _name_for(r["handle"]),
                 "chat_id": r["chat_guid"],
-                "chat_name": r["chat_name"],
+                "chat_name": _name_for(r["chat_name"]) or r["chat_name"],
                 "body": r["body"],
             }
             for r in rows
@@ -330,7 +401,7 @@ def list_chats(limit: int = 30, since: str = "") -> str:
         out = []
         for ch in con.execute(sql, args).fetchall():
             parts = [
-                r["id"]
+                {"handle": r["id"], "name": _name_for(r["id"])}
                 for r in con.execute(
                     """SELECT h.id FROM chat_handle_join j
                        JOIN handle h ON h.ROWID = j.handle_id
@@ -345,7 +416,7 @@ def list_chats(limit: int = 30, since: str = "") -> str:
             out.append(
                 {
                     "chat_id": ch["guid"],
-                    "name": ch["name"],
+                    "name": _name_for(ch["name"]) or ch["name"],
                     "participants": parts,
                     "last_time": _ts(ch["last_date"]),
                     "last_preview": (
@@ -418,50 +489,17 @@ def get_contact_handles(name: str) -> str:
     Falls back to substring-matching the handles seen in chat.db when the
     AddressBook database is not readable.
     """
-    like = f"%{name}%"
-    results, readable = [], False
-    for db in sorted(glob.glob(ADDRESSBOOK_GLOB, recursive=True)):
-        try:
-            con = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True)
-            con.row_factory = sqlite3.Row
-            rows = con.execute(
-                """
-                SELECT r.ZFIRSTNAME AS first, r.ZLASTNAME AS last,
-                       p.ZFULLNUMBER AS value, 'phone' AS kind
-                FROM ZABCDRECORD r
-                JOIN ZABCDPHONENUMBER p ON p.ZOWNER = r.Z_PK
-                WHERE (COALESCE(r.ZFIRSTNAME,'') || ' ' ||
-                       COALESCE(r.ZLASTNAME,'')) LIKE ?
-                UNION ALL
-                SELECT r.ZFIRSTNAME, r.ZLASTNAME, e.ZADDRESS, 'email'
-                FROM ZABCDRECORD r
-                JOIN ZABCDEMAILADDRESS e ON e.ZOWNER = r.Z_PK
-                WHERE (COALESCE(r.ZFIRSTNAME,'') || ' ' ||
-                       COALESCE(r.ZLASTNAME,'')) LIKE ?
-                """,
-                (like, like),
-            ).fetchall()
-            readable = True
-        except sqlite3.Error:
-            continue
-        finally:
-            try:
-                con.close()
-            except Exception:
-                pass
-        for r in rows:
-            value = r["value"] or ""
-            if r["kind"] == "phone":
-                value = re.sub(r"[^\d+]", "", value)
-            results.append(
-                {
-                    "name": " ".join(
-                        p for p in (r["first"], r["last"]) if p
-                    ),
-                    "kind": r["kind"],
-                    "handle": value,
-                }
-            )
+    rows, readable = _addressbook_rows()
+    needle = name.lower()
+    results = [
+        {
+            "name": contact,
+            "kind": kind,
+            "handle": re.sub(r"[^\d+]", "", value) if kind == "phone" else value,
+        }
+        for contact, kind, value in rows
+        if needle in contact.lower()
+    ]
     if readable:
         return json.dumps(
             {"source": "addressbook", "handles": results}, ensure_ascii=False

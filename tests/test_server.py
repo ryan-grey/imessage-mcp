@@ -18,9 +18,12 @@ import make_fixture
 _TMP = tempfile.mkdtemp(prefix="imessage-mcp-test-")
 _FIXTURE = os.path.join(_TMP, "fixture-chat.db")
 make_fixture.build(_FIXTURE)
+_AB = os.path.join(_TMP, "AddressBook-v22.abcddb")
+make_fixture.build_addressbook(_AB)
 os.environ["IMESSAGE_CHAT_DB"] = _FIXTURE
 os.environ["IMESSAGE_INDEX_DB"] = os.path.join(_TMP, "index.db")
 os.environ["IMESSAGE_SENT_LOG"] = os.path.join(_TMP, "sent.log")
+os.environ["IMESSAGE_ADDRESSBOOK_GLOB"] = _AB
 
 import server  # noqa: E402  (env must be set before this import)
 
@@ -69,10 +72,15 @@ def test_list_chats():
     assert out["count"] == 2
     byname = {c["name"]: c for c in out["chats"]}
     group = byname["Fixture Group"]
-    assert set(group["participants"]) == {"+15550002222", "fixture@example.com"}
+    parts = {p["handle"]: p["name"] for p in group["participants"]}
+    assert parts == {
+        "+15550002222": None,  # not in the synthetic AddressBook
+        "fixture@example.com": "Blake Sample",
+    }
     assert group["unread"] == 2
     assert group["last_preview"].startswith("long one:")
-    one = byname["+15550001111"]
+    one = byname["Alex Fixture"]  # 1:1 chat renamed from its raw handle
+    assert one["chat_id"] == "iMessage;-;+15550001111"
     assert one["unread"] == 0
     assert one["last_time"] is not None
 
@@ -97,10 +105,30 @@ def test_get_thread_by_handle_and_chat():
     assert "error" in json.loads(server.get_thread())
 
 
-def test_get_contact_handles_falls_back_to_chat_db():
-    # No AddressBook in the test environment -> handle fallback.
-    out = json.loads(server.get_contact_handles("fixture"))
-    assert any(h["handle"] == "fixture@example.com" for h in out["handles"])
+def test_get_contact_handles():
+    out = json.loads(server.get_contact_handles("alex"))
+    assert out["source"] == "addressbook"
+    assert out["handles"] == [
+        {"name": "Alex Fixture", "kind": "phone", "handle": "5550001111"}
+    ]
+    out = json.loads(server.get_contact_handles("sample"))
+    assert out["handles"][0]["handle"] == "Fixture@Example.com"
+
+
+def test_contact_name_join():
+    assert server._norm_handle("+1 (555) 000-1111") == "5550001111"
+    assert server._norm_handle("Fixture@Example.COM") == "fixture@example.com"
+    assert server._norm_handle("") is None
+    assert server._name_for("+15550001111") == "Alex Fixture"
+    assert server._name_for("fixture@example.com") == "Blake Sample"
+    assert server._name_for("+19998887777") is None
+    out = json.loads(server.search_messages("pizza"))
+    incoming = [m for m in out["messages"] if not m["from_me"]][0]
+    assert incoming["sender_name"] == "Alex Fixture"
+    assert incoming["chat_name"] == "Alex Fixture"
+    thread = json.loads(server.get_thread(chat_id="iMessage;+;chat00000fixture"))
+    names = {m["sender"]: m["sender_name"] for m in thread["messages"]}
+    assert names == {"+15550002222": None, "fixture@example.com": "Blake Sample"}
 
 
 def test_index_status():
