@@ -209,11 +209,13 @@ def _addressbook_rows():
     AddressBook source. Returns (rows, readable)."""
     query = """
         SELECT r.ZFIRSTNAME AS first, r.ZLASTNAME AS last,
+               r.ZORGANIZATION AS org,
                p.ZFULLNUMBER AS value, 'phone' AS kind
         FROM ZABCDRECORD r
         JOIN ZABCDPHONENUMBER p ON p.ZOWNER = r.Z_PK
         UNION ALL
-        SELECT r.ZFIRSTNAME, r.ZLASTNAME, e.ZADDRESS, 'email'
+        SELECT r.ZFIRSTNAME, r.ZLASTNAME, r.ZORGANIZATION,
+               e.ZADDRESS, 'email'
         FROM ZABCDRECORD r
         JOIN ZABCDEMAILADDRESS e ON e.ZOWNER = r.Z_PK
     """
@@ -243,7 +245,11 @@ def _addressbook_rows():
             continue
         readable = True
         for r in got:
-            name = " ".join(p for p in (r["first"], r["last"]) if p)
+            # Organization-only cards (schools, businesses) have no
+            # first/last name - the org name is their name.
+            name = " ".join(p for p in (r["first"], r["last"]) if p) or (
+                r["org"] or ""
+            ).strip()
             if name and r["value"]:
                 rows.append((name, r["kind"], r["value"]))
     return rows, readable
@@ -264,18 +270,34 @@ _CONTACTS = {"at": 0.0, "map": {}}
 
 
 def _contact_map():
-    """normalized handle -> contact name, cached for five minutes."""
+    """normalized handle -> contact name, cached for five minutes.
+    Phone numbers are additionally keyed by their last seven digits, so a
+    card holding a local-format number like '802-8837' still matches the
+    full +1423... handle Messages uses."""
     if time.time() - _CONTACTS["at"] > 300:
         rows, _ = _addressbook_rows()
-        _CONTACTS["map"] = {
-            _norm_handle(value): name for name, _kind, value in rows
-        }
+        mapping = {}
+        for name, _kind, value in rows:
+            key = _norm_handle(value)
+            if not key:
+                continue
+            mapping.setdefault(key, name)
+            if "@" not in key and len(key) >= 7:
+                mapping.setdefault(key[-7:], name)
+        _CONTACTS["map"] = mapping
         _CONTACTS["at"] = time.time()
     return _CONTACTS["map"]
 
 
 def _name_for(handle):
-    return _contact_map().get(_norm_handle(handle))
+    mapping = _contact_map()
+    key = _norm_handle(handle)
+    if not key:
+        return None
+    hit = mapping.get(key)
+    if hit is None and "@" not in key and len(key) >= 7:
+        hit = mapping.get(key[-7:])
+    return hit
 
 
 _OWNER = {"at": 0.0, "name": None}

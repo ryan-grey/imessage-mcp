@@ -132,6 +132,21 @@ def test_contact_name_join():
     assert names == {"+15550002222": None, "fixture@example.com": "Blake Sample"}
 
 
+def test_org_only_contacts_resolve():
+    server._CONTACTS["at"] = 0.0
+    # org name stands in when first/last are empty
+    assert server._name_for("+15554600001") == "Synthetic Middle School"
+    # a 7-digit local-format card number matches the full handle
+    assert server._name_for("+14234603333") == "Fixture Charity"
+    assert server._name_for("4603333") == "Fixture Charity"
+    # and get_contact_handles finds org cards by name
+    out = json.loads(server.get_contact_handles("middle school"))
+    assert out["handles"] == [
+        {"name": "Synthetic Middle School", "kind": "phone",
+         "handle": "5554600001"}
+    ]
+
+
 def test_owner_name_on_from_me_rows():
     server._OWNER["at"] = 0.0
     out = json.loads(server.get_thread(handle="+15550001111"))
