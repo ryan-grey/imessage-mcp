@@ -267,9 +267,35 @@ class _RealCN:
             self._note_available = bool(ok)
         return self._note_available
 
-    def fetch(self, container_id=None, group_id=None, name_query=None):
+    def _enumerate(self, pred, keys, unified):
+        """CNContact objects for a predicate. unified=False walks the raw
+        per-container cards (CNContactFetchRequest.unifyResults = NO), so
+        every piece of a linked contact is visible with its real container."""
         C = self._fw()
         store = self._store()
+        if unified and pred is not None:
+            found, err = store.unifiedContactsMatchingPredicate_keysToFetch_error_(
+                pred, keys, None
+            )
+            if err is not None:
+                raise RuntimeError(str(err))
+            return list(found or [])
+        req = C.CNContactFetchRequest.alloc().initWithKeysToFetch_(keys)
+        if pred is not None:
+            req.setPredicate_(pred)
+        if not unified:
+            req.setUnifyResults_(False)
+        out = []
+        ok, err = store.enumerateContactsWithFetchRequest_error_usingBlock_(
+            req, None, lambda c, stop: out.append(c)
+        )
+        if not ok:
+            raise RuntimeError(str(err))
+        return out
+
+    def fetch(self, container_id=None, group_id=None, name_query=None,
+              unified=True):
+        C = self._fw()
         keys = self._keys(with_note=self._with_note())
         if group_id:
             pred = C.CNContact.predicateForContactsInGroupWithIdentifier_(group_id)
@@ -280,21 +306,23 @@ class _RealCN:
         elif name_query:
             pred = C.CNContact.predicateForContactsMatchingName_(name_query)
         else:
-            out = []
-            req = C.CNContactFetchRequest.alloc().initWithKeysToFetch_(keys)
-            store.enumerateContactsWithFetchRequest_error_usingBlock_(
-                req, None, lambda c, stop: out.append(self._shape(c))
-            )
-            return out
-        found, err = store.unifiedContactsMatchingPredicate_keysToFetch_error_(
-            pred, keys, None
+            pred = None
+        return [self._shape(c) for c in self._enumerate(pred, keys, unified)]
+
+    def _piece_obj(self, identifier):
+        """The raw per-container card with this exact identifier, or None
+        if the identifier only names a unified contact."""
+        C = self._fw()
+        pred = C.CNContact.predicateForContactsWithIdentifiers_([identifier])
+        found = self._enumerate(
+            pred, self._keys(with_note=self._with_note()), unified=False
         )
-        if err is not None:
-            raise RuntimeError(str(err))
-        return [self._shape(c) for c in found]
+        return found[0] if found else None
 
     def get(self, identifier):
-        C = self._fw()
+        piece = self._piece_obj(identifier)
+        if piece is not None:
+            return self._shape(piece)
         store = self._store()
         c, err = store.unifiedContactWithIdentifier_keysToFetch_error_(
             identifier, self._keys(with_note=self._with_note()), None
@@ -302,8 +330,12 @@ class _RealCN:
         return self._shape(c) if c is not None else None
 
     def _raw(self, identifier):
-        """The mutable CNContact behind an identifier, for save requests."""
-        C = self._fw()
+        """The mutable CNContact behind an identifier, for save requests.
+        Prefers the exact per-container piece so writes land on one real
+        card, falling back to the unified contact."""
+        piece = self._piece_obj(identifier)
+        if piece is not None:
+            return piece.mutableCopy()
         store = self._store()
         c, err = store.unifiedContactWithIdentifier_keysToFetch_error_(
             identifier, self._keys(with_note=self._with_note()), None
@@ -311,6 +343,26 @@ class _RealCN:
         if c is None:
             raise RuntimeError(f"no contact with identifier {identifier!r}")
         return c.mutableCopy()
+
+    def linked_pieces(self, identifier):
+        """Every raw per-container card linked into the same unified
+        contact as this identifier (unified or piece id both work).
+        Empty when the contact has a single, container-resolved card."""
+        C = self._fw()
+        store = self._store()
+        c, err = store.unifiedContactWithIdentifier_keysToFetch_error_(
+            identifier, [C.CNContactIdentifierKey], None
+        )
+        if c is None:
+            return []
+        try:
+            pred = C.CNContact.predicateForContactsLinkedToContact_(c)
+            objs = self._enumerate(
+                pred, self._keys(with_note=self._with_note()), unified=False
+            )
+        except Exception:
+            objs = []
+        return [self._shape(o) for o in objs]
 
     def containers(self):
         C = self._fw()
@@ -589,17 +641,79 @@ def _resolve_contact(identifier="", name=""):
 
 
 def _annotate(card):
-    """Add display name, container label, and group names to a card."""
+    """Add display name, container label, and group names to a card.
+    A unified contact resolves to no container; those are labeled
+    'linked' with their underlying per-account pieces listed."""
     card = dict(card)
     card["name"] = _display_name(card)
     container = CN.container_of(card["identifier"])
-    card["container"] = _account_label(container)
+    if container is None:
+        pieces = CN.linked_pieces(card["identifier"])
+        if len(pieces) > 1:
+            card["container"] = "linked"
+            card["linked"] = [
+                {
+                    "identifier": p["identifier"],
+                    "container": _account_label(
+                        CN.container_of(p["identifier"])
+                    ),
+                }
+                for p in pieces
+            ]
+        else:
+            card["container"] = None
+    else:
+        card["container"] = _account_label(container)
     card["groups"] = [
         g["name"]
         for g in CN.groups()
         if card["identifier"] in CN.group_member_ids(g["id"])
     ]
     return card
+
+
+def _truncated(card, cap=5):
+    """Phones/emails capped for tool output - spam-blocking cards carry
+    hundreds of numbers and blow past client output limits."""
+    card = dict(card)
+    for field in ("phones", "emails"):
+        values = card.get(field) or []
+        if len(values) > cap:
+            card[field] = values[:cap] + [
+                {"label": "truncated", "value": f"+{len(values) - cap} more"}
+            ]
+    return card
+
+
+def _linked_refusal(identifier):
+    """Refusal JSON when a write targets a multi-piece unified identifier,
+    else None. Writes must land on one real per-account card - the
+    framework's behavior on a unified id with several pieces is undefined
+    enough to be dangerous."""
+    if CN.container_of(identifier) is not None:
+        return None
+    pieces = CN.linked_pieces(identifier)
+    if len(pieces) > 1:
+        return json.dumps(
+            {
+                "ok": False,
+                "error": f"linked card: {identifier!r} is a unified contact "
+                f"with {len(pieces)} underlying cards. Pass one of its piece "
+                "identifiers instead - see linked_cards.",
+                "pieces": [
+                    {
+                        "identifier": p["identifier"],
+                        "container": _account_label(
+                            CN.container_of(p["identifier"])
+                        ),
+                        "name": _display_name(p),
+                    }
+                    for p in pieces
+                ],
+            },
+            ensure_ascii=False,
+        )
+    return None
 
 
 def _log_change(tool, target, before, after, result):
@@ -708,11 +822,56 @@ def find_duplicates(strategy: str = "phone") -> str:
             {
                 "matched_on": {"strategy": strategy, "value": key},
                 "differing_fields": differing,
-                "cards": [_annotate(m) for m in members],
+                "cards": [_truncated(_annotate(m)) for m in members],
             }
         )
     return json.dumps(
         {"count": len(clusters), "clusters": clusters}, ensure_ascii=False
+    )
+
+
+def linked_cards(identifier: str = "", name: str = "") -> str:
+    """The per-account cards behind one unified contact: identifier,
+    container, full fields, groups, and which fields differ between the
+    pieces. Works given the unified identifier or any piece identifier."""
+    try:
+        card = _resolve_contact(identifier, name)
+    except RuntimeError as e:
+        return json.dumps({"error": str(e)})
+    pieces = CN.linked_pieces(card["identifier"]) or [card]
+    docs = []
+    for p in pieces:
+        holder = CN.container_of(p["identifier"])
+        docs.append(
+            {
+                **p,
+                "name": _display_name(p),
+                "container": (
+                    {**holder, "account": _account_label(holder)}
+                    if holder
+                    else None
+                ),
+                "groups": [
+                    g["name"]
+                    for g in CN.groups()
+                    if p["identifier"] in CN.group_member_ids(g["id"])
+                ],
+            }
+        )
+    differing = [
+        field
+        for field in ("given_name", "family_name", "organization",
+                      "phones", "emails", "addresses", "note")
+        if len({json.dumps(d.get(field), sort_keys=True) for d in docs}) > 1
+    ]
+    return json.dumps(
+        {
+            "queried": card["identifier"],
+            "count": len(docs),
+            "differing_fields": differing,
+            "cards": docs,
+        },
+        ensure_ascii=False,
     )
 
 
@@ -760,7 +919,7 @@ def export_contacts(container: str = "", path: str = "") -> str:
 
     def _card_doc(card):
         holder = CN.container_of(card["identifier"])
-        return {
+        doc = {
             **card,
             "name": _display_name(card),
             "container": (
@@ -772,10 +931,26 @@ def export_contacts(container: str = "", path: str = "") -> str:
                 if card["identifier"] in membership[g["id"]]
             ],
         }
+        if holder is None:
+            pieces = CN.linked_pieces(card["identifier"])
+            if len(pieces) > 1:
+                doc["container"] = "linked"
+                doc["linked_pieces"] = [_card_doc(p) for p in pieces]
+        return doc
 
     docs = [_card_doc(c) for c in cards]
-    counts = Counter(
-        (d["container"] or {}).get("account") or "unknown" for d in docs
+
+    def _acct(doc):
+        if doc["container"] == "linked":
+            return "linked"
+        return (doc["container"] or {}).get("account") or "unknown"
+
+    counts = Counter(_acct(d) for d in docs)
+    piece_accounts = Counter(
+        _acct(p)
+        for d in docs
+        if d.get("linked_pieces")
+        for p in d["linked_pieces"]
     )
 
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -811,6 +986,11 @@ def export_contacts(container: str = "", path: str = "") -> str:
             "json": json_path.stat().st_size,
         },
     }
+    if piece_accounts:
+        result["linked"] = {
+            "cards": counts.get("linked", 0),
+            "pieces_by_account": dict(piece_accounts),
+        }
     _log_change("export_contacts", str(parent), None,
                 {k: result[k] for k in ("count", "vcf", "json")}, "ok")
     return json.dumps(result, ensure_ascii=False)
@@ -838,6 +1018,9 @@ def update_contact(identifier: str, fields: dict, confirm: bool = False) -> str:
     Requires confirm=true."""
     if confirm is not True:
         return _refuse("update_contact")
+    refusal = _linked_refusal(identifier)
+    if refusal:
+        return refusal
     before = CN.get(identifier)
     if before is None:
         return json.dumps({"ok": False, "error": f"no contact {identifier!r}"})
@@ -851,6 +1034,9 @@ def delete_contact(identifier: str, confirm: bool = False) -> str:
     """Delete a card permanently. Requires confirm=true."""
     if confirm is not True:
         return _refuse("delete_contact")
+    refusal = _linked_refusal(identifier)
+    if refusal:
+        return refusal
     before = CN.get(identifier)
     if before is None:
         return json.dumps({"ok": False, "error": f"no contact {identifier!r}"})
@@ -875,6 +1061,9 @@ def add_to_group(identifier: str, group: str, confirm: bool = False) -> str:
     """Add a contact to a group (by group name or id). Requires confirm=true."""
     if confirm is not True:
         return _refuse("add_to_group")
+    refusal = _linked_refusal(identifier)
+    if refusal:
+        return refusal
     g = _resolve_group(group)
     CN.add_member(identifier, g["id"])
     _log_change("add_to_group", identifier, None, {"group": g["name"]}, "ok")
@@ -885,6 +1074,9 @@ def remove_from_group(identifier: str, group: str, confirm: bool = False) -> str
     """Remove a contact from a group. Requires confirm=true."""
     if confirm is not True:
         return _refuse("remove_from_group")
+    refusal = _linked_refusal(identifier)
+    if refusal:
+        return refusal
     g = _resolve_group(group)
     CN.remove_member(identifier, g["id"])
     _log_change("remove_from_group", identifier, {"group": g["name"]}, None, "ok")
@@ -898,6 +1090,9 @@ def move_to_container(identifier: str, container: str = "iCloud",
     the target, then delete the source card. Requires confirm=true."""
     if confirm is not True:
         return _refuse("move_to_container")
+    refusal = _linked_refusal(identifier)
+    if refusal:
+        return refusal
     target = _resolve_container(container)
     before = CN.get(identifier)
     if before is None:
@@ -951,6 +1146,10 @@ def merge_contacts(identifiers: list, keep: str, confirm: bool = False) -> str:
         return json.dumps({"ok": False, "error": "keep must be one of identifiers"})
     if len(identifiers) < 2:
         return json.dumps({"ok": False, "error": "need at least two identifiers"})
+    for ident in identifiers:
+        refusal = _linked_refusal(ident)
+        if refusal:
+            return refusal
     cards = []
     for ident in identifiers:
         card = CN.get(ident)
@@ -1004,6 +1203,7 @@ for _fn in (
     authorization_status,
     list_contacts,
     get_contact,
+    linked_cards,
     find_duplicates,
     export_contacts,
     create_contact,
