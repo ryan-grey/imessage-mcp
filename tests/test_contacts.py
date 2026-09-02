@@ -651,6 +651,41 @@ def test_set_photo():
     assert photo_lines[-1]["after"]["source"] == small
 
 
+def test_set_image_fetches_the_image_keys():
+    """Regression: setting imageData on a contact fetched without
+    CNContactImageDataKey throws CNPropertyNotFetchedException. The real
+    adapter must request the image keys when fetching for set_image."""
+    import Contacts as C
+
+    real = contacts._RealCN()
+    real._note_available = False  # skip the store probe in _keys()
+    seen = {}
+
+    def capture_piece(identifier, keys=None):
+        seen["keys"] = list(keys or [])
+        raise RuntimeError("stop before touching the real store")
+
+    real._piece_obj = capture_piece
+    try:
+        real.set_image("X:ABPerson", b"\x89PNGfake")
+    except RuntimeError:
+        pass
+    assert C.CNContactImageDataKey in seen["keys"]
+    assert C.CNContactImageDataAvailableKey in seen["keys"]
+
+    # ordinary writes keep the standard key set - no image key
+    def capture_update(identifier, keys=None):
+        seen["update_keys"] = list(keys or [])
+        raise RuntimeError("stop")
+
+    real._piece_obj = capture_update
+    try:
+        real.update("X:ABPerson", {"given_name": "Y"})
+    except RuntimeError:
+        pass
+    assert C.CNContactImageDataKey not in seen["update_keys"]
+
+
 def test_me_card():
     fake, a, b, c, gid = fresh()
     out = json.loads(contacts.me_card())
