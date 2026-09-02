@@ -25,8 +25,10 @@ class FakeCN:
 
     def __init__(self):
         self._seq = 0
-        self.cards = {}       # id -> card dict
+        self.cards = {}       # id -> card dict (raw per-container pieces)
         self.card_container = {}
+        self.unified = {}     # unified id -> synthesized union card
+        self.links = {}       # unified id -> [piece ids]
         self.containers_list = [
             {"id": "ICLOUD-1", "name": "Card", "type": "cardDAV"},
             {"id": "GOOGLE-1", "name": "Google (rgrey.web@gmail.com)",
@@ -43,15 +45,37 @@ class FakeCN:
     def seed(self, fields, container_id="ICLOUD-1"):
         return self.create(fields, container_id)
 
+    def seed_linked(self, unified_fields, pieces):
+        """A unified contact over per-container pieces, the way
+        CNContactStore presents linked cards: the unified id resolves to
+        no container. pieces: [(fields, container_id), ...]."""
+        pids = [self.create(f, cid) for f, cid in pieces]
+        uid = self._new_id("UNIFIED")
+        card = {"identifier": uid, "given_name": "", "middle_name": "",
+                "family_name": "", "organization": "", "phones": [],
+                "emails": [], "addresses": [], "note": None}
+        card.update(unified_fields)
+        card["identifier"] = uid
+        self.unified[uid] = card
+        self.links[uid] = pids
+        return uid, pids
+
     # --- adapter interface ---
-    def fetch(self, container_id=None, group_id=None, name_query=None):
-        cards = list(self.cards.values())
+    def fetch(self, container_id=None, group_id=None, name_query=None,
+              unified=True):
+        piece_ids = {p for ps in self.links.values() for p in ps}
+        if unified:
+            cards = [c for c in self.cards.values()
+                     if c["identifier"] not in piece_ids]
+            cards += list(self.unified.values())
+        else:
+            cards = list(self.cards.values())
         if group_id:
             cards = [c for c in cards
                      if c["identifier"] in self.members.get(group_id, set())]
         elif container_id:
             cards = [c for c in cards
-                     if self.card_container[c["identifier"]] == container_id]
+                     if self.card_container.get(c["identifier"]) == container_id]
         elif name_query:
             q = name_query.lower()
             cards = [c for c in cards
@@ -59,8 +83,16 @@ class FakeCN:
         return [dict(c) for c in cards]
 
     def get(self, identifier):
-        c = self.cards.get(identifier)
+        c = self.cards.get(identifier) or self.unified.get(identifier)
         return dict(c) if c else None
+
+    def linked_pieces(self, identifier):
+        if identifier in self.links:
+            pids = self.links[identifier]
+        else:
+            pids = next((ps for ps in self.links.values()
+                         if identifier in ps), [])
+        return [dict(self.cards[p]) for p in pids]
 
     def containers(self):
         return [dict(c) for c in self.containers_list]
@@ -98,6 +130,12 @@ class FakeCN:
         del self.card_container[identifier]
         for ids in self.members.values():
             ids.discard(identifier)
+        # a link with one remaining piece dissolves, as in the real store
+        for uid in list(self.links):
+            self.links[uid] = [p for p in self.links[uid] if p != identifier]
+            if len(self.links[uid]) < 2:
+                del self.links[uid]
+                self.unified.pop(uid, None)
 
     def create_group(self, name, container_id):
         gid = self._new_id("GROUP")
@@ -302,6 +340,120 @@ def test_group_tools():
     out = json.loads(contacts.remove_from_group(c, "New Circle", confirm=True))
     assert out["ok"]
     assert json.loads(contacts.get_contact(identifier=c))["groups"] == []
+
+
+def with_linked_pair():
+    """fresh() plus a unified contact hiding an iCloud piece and a Google
+    piece - the shape CNContactStore presents for linked cards."""
+    fake, a, b, c, gid = fresh()
+    uid, (ic, gg) = fake.seed_linked(
+        {"given_name": "Miriam", "family_name": "Grey",
+         "emails": [{"label": "home", "value": "mg@example.com"},
+                    {"label": "old", "value": "md@example.com"}]},
+        [({"given_name": "Miriam", "family_name": "Grey",
+           "emails": [{"label": "home", "value": "mg@example.com"}],
+           "phones": [{"label": "mobile", "value": "555-333-4444"}]},
+          "ICLOUD-1"),
+         ({"given_name": "Miriam", "family_name": "Dotson",
+           "emails": [{"label": "old", "value": "md@example.com"}]},
+          "GOOGLE-1")],
+    )
+    fake.add_member(uid, gid)  # the unified card carries iCloud groups
+    return fake, a, b, c, gid, uid, ic, gg
+
+
+def test_list_annotates_linked_cards():
+    fake, a, b, c, gid, uid, ic, gg = with_linked_pair()
+    out = json.loads(contacts.list_contacts())
+    assert out["count"] == 4  # 3 plain + 1 unified; pieces stay hidden
+    unified = next(x for x in out["contacts"] if x["identifier"] == uid)
+    assert unified["container"] == "linked"
+    assert {(p["identifier"], p["container"]) for p in unified["linked"]} == {
+        (ic, "iCloud"), (gg, "Google")}
+    assert unified["groups"] == ["Family"]
+    plain = next(x for x in out["contacts"] if x["identifier"] == a)
+    assert plain["container"] == "iCloud" and "linked" not in plain
+
+
+def test_linked_cards_tool():
+    fake, a, b, c, gid, uid, ic, gg = with_linked_pair()
+    out = json.loads(contacts.linked_cards(identifier=uid))
+    assert out["count"] == 2
+    byid = {x["identifier"]: x for x in out["cards"]}
+    assert byid[ic]["container"]["account"] == "iCloud"
+    assert byid[gg]["container"]["account"] == "Google"
+    assert "family_name" in out["differing_fields"]
+    assert "emails" in out["differing_fields"]
+    # a piece identifier resolves to the same pair
+    via_piece = json.loads(contacts.linked_cards(identifier=gg))
+    assert {x["identifier"] for x in via_piece["cards"]} == {ic, gg}
+    # a plain card reports itself, one piece, nothing differing
+    solo = json.loads(contacts.linked_cards(identifier=a))
+    assert solo["count"] == 1 and solo["differing_fields"] == []
+
+
+def test_writes_refuse_unified_identifier():
+    fake, a, b, c, gid, uid, ic, gg = with_linked_pair()
+    for call in (
+        lambda: contacts.update_contact(uid, {"given_name": "X"}, confirm=True),
+        lambda: contacts.delete_contact(uid, confirm=True),
+        lambda: contacts.move_to_container(uid, "iCloud", confirm=True),
+        lambda: contacts.add_to_group(uid, "Family", confirm=True),
+        lambda: contacts.remove_from_group(uid, "Family", confirm=True),
+        lambda: contacts.merge_contacts([uid, a], keep=a, confirm=True),
+    ):
+        out = json.loads(call())
+        assert out["ok"] is False and "linked card" in out["error"]
+        assert {(p["identifier"], p["container"]) for p in out["pieces"]} == {
+            (ic, "iCloud"), (gg, "Google")}
+    assert uid in fake.unified and len(fake.cards) == 5  # nothing changed
+
+
+def test_merge_linked_pieces_into_icloud():
+    fake, a, b, c, gid, uid, ic, gg = with_linked_pair()
+    out = json.loads(contacts.merge_contacts([ic, gg], keep=ic, confirm=True))
+    assert out["ok"]
+    merged = out["contact"]
+    assert merged["identifier"] == ic
+    assert merged["container"] == "iCloud"
+    assert {e["value"] for e in merged["emails"]} == {
+        "mg@example.com", "md@example.com"}
+    assert merged["family_name"] == "Grey"  # keep's scalar wins
+    assert gg not in fake.cards
+    assert uid not in fake.unified  # the link dissolved with its 2nd piece
+
+
+def test_find_duplicates_truncates_long_lists():
+    fake, a, b, c, gid = fresh()
+    fake.seed({"given_name": "Spam", "family_name": "Call",
+               "phones": [{"label": "other", "value": f"555-000-{n:04d}"}
+                          for n in range(12)] +
+                         [{"label": "mobile", "value": "+1 (555) 000-1111"}]})
+    out = json.loads(contacts.find_duplicates("phone"))
+    cluster = next(cl for cl in out["clusters"]
+                   if cl["matched_on"]["value"] == "5550001111")
+    spam = next(x for x in cluster["cards"] if x["given_name"] == "Spam")
+    assert len(spam["phones"]) == 6
+    assert spam["phones"][-1] == {"label": "truncated", "value": "+8 more"}
+    other = next(x for x in cluster["cards"] if x["identifier"] == a)
+    assert other["phones"][-1]["value"] != "+8 more"  # short lists untouched
+
+
+def test_export_includes_linked_pieces():
+    fake, a, b, c, gid, uid, ic, gg = with_linked_pair()
+    outdir = os.path.join(_TMP, "backups-linked")
+    out = json.loads(contacts.export_contacts(path=outdir))
+    assert out["count"] == 4
+    assert out["containers"] == {"iCloud": 2, "Google": 1, "linked": 1}
+    assert out["linked"] == {"cards": 1,
+                             "pieces_by_account": {"iCloud": 1, "Google": 1}}
+    doc = json.load(open(out["json"], encoding="utf-8"))
+    unified = next(x for x in doc["contacts"] if x["identifier"] == uid)
+    assert unified["container"] == "linked"
+    pieces = {p["identifier"]: p for p in unified["linked_pieces"]}
+    assert pieces[ic]["container"]["account"] == "iCloud"
+    assert pieces[gg]["container"]["account"] == "Google"
+    assert pieces[gg]["family_name"] == "Dotson"
 
 
 def test_export_writes_vcf_and_json():
