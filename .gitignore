@@ -1,8 +1,9 @@
-# Local state - never commit message data or send history
+# Local state - never commit message data, send history, or contact changes
 index.db
 index.db-shm
 index.db-wal
 sent.log
+contacts-changes.log
 
 # Anything that could hold real handles or config
 .env

@@ -1,0 +1,318 @@
+"""Tests for the Contacts server against a fully synthetic in-memory
+adapter - the Contacts.framework layer is swapped out, so no real card is
+ever read or written. Runs under pytest or plainly:
+
+    python3 tests/test_contacts.py
+"""
+
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+TESTS = Path(__file__).resolve().parent
+sys.path.insert(0, str(TESTS.parent))
+
+_TMP = tempfile.mkdtemp(prefix="contacts-mcp-test-")
+os.environ["CONTACTS_CHANGES_LOG"] = os.path.join(_TMP, "contacts-changes.log")
+
+import contacts  # noqa: E402
+
+
+class FakeCN:
+    """In-memory stand-in for the Contacts.framework adapter."""
+
+    def __init__(self):
+        self._seq = 0
+        self.cards = {}       # id -> card dict
+        self.card_container = {}
+        self.containers_list = [
+            {"id": "ICLOUD-1", "name": "Card", "type": "cardDAV"},
+            {"id": "GOOGLE-1", "name": "Google (rgrey.web@gmail.com)",
+             "type": "cardDAV"},
+            {"id": "LOCAL-1", "name": "On My Mac", "type": "local"},
+        ]
+        self.groups_list = []  # {id, name, container_id}
+        self.members = {}      # group id -> set of card ids
+
+    def _new_id(self, prefix):
+        self._seq += 1
+        return f"{prefix}-{self._seq}"
+
+    def seed(self, fields, container_id="ICLOUD-1"):
+        return self.create(fields, container_id)
+
+    # --- adapter interface ---
+    def fetch(self, container_id=None, group_id=None, name_query=None):
+        cards = list(self.cards.values())
+        if group_id:
+            cards = [c for c in cards
+                     if c["identifier"] in self.members.get(group_id, set())]
+        elif container_id:
+            cards = [c for c in cards
+                     if self.card_container[c["identifier"]] == container_id]
+        elif name_query:
+            q = name_query.lower()
+            cards = [c for c in cards
+                     if q in contacts._display_name(c).lower()]
+        return [dict(c) for c in cards]
+
+    def get(self, identifier):
+        c = self.cards.get(identifier)
+        return dict(c) if c else None
+
+    def containers(self):
+        return [dict(c) for c in self.containers_list]
+
+    def container_of(self, identifier):
+        cid = self.card_container.get(identifier)
+        return next((dict(c) for c in self.containers_list if c["id"] == cid),
+                    None)
+
+    def groups(self, container_id=None):
+        return [
+            {"id": g["id"], "name": g["name"]}
+            for g in self.groups_list
+            if container_id is None or g["container_id"] == container_id
+        ]
+
+    def group_member_ids(self, group_id):
+        return sorted(self.members.get(group_id, set()))
+
+    def create(self, fields, container_id):
+        ident = self._new_id("CARD")
+        card = {"identifier": ident, "given_name": "", "middle_name": "",
+                "family_name": "", "organization": "", "phones": [],
+                "emails": [], "addresses": [], "note": None}
+        card.update(fields)
+        self.cards[ident] = card
+        self.card_container[ident] = container_id
+        return ident
+
+    def update(self, identifier, fields):
+        self.cards[identifier].update(fields)
+
+    def delete(self, identifier):
+        del self.cards[identifier]
+        del self.card_container[identifier]
+        for ids in self.members.values():
+            ids.discard(identifier)
+
+    def create_group(self, name, container_id):
+        gid = self._new_id("GROUP")
+        self.groups_list.append(
+            {"id": gid, "name": name, "container_id": container_id})
+        self.members[gid] = set()
+        return gid
+
+    def add_member(self, identifier, group_id):
+        self.members[group_id].add(identifier)
+
+    def remove_member(self, identifier, group_id):
+        self.members[group_id].discard(identifier)
+
+
+def fresh():
+    fake = FakeCN()
+    contacts.CN = fake
+    a = fake.seed({"given_name": "Alex", "family_name": "Fixture",
+                   "phones": [{"label": "mobile", "value": "+1 (555) 000-1111"}],
+                   "emails": [{"label": "home", "value": "alex@example.com"}]})
+    b = fake.seed({"given_name": "Alex", "family_name": "Fixture",
+                   "phones": [{"label": "work", "value": "5550001111"}],
+                   "emails": [{"label": "work", "value": "afx@example.com"}],
+                   "organization": "Fixture Co"}, container_id="GOOGLE-1")
+    c = fake.seed({"given_name": "Blake", "family_name": "Sample",
+                   "emails": [{"label": "home", "value": "blake@example.com"}]})
+    gid = fake.create_group("Family", "ICLOUD-1")
+    fake.add_member(a, gid)
+    return fake, a, b, c, gid
+
+
+def test_list_and_query():
+    fake, a, b, c, gid = fresh()
+    out = json.loads(contacts.list_contacts())
+    assert out["count"] == 3
+    byid = {x["identifier"]: x for x in out["contacts"]}
+    assert byid[a]["container"] == "iCloud"
+    assert byid[b]["container"] == "Google"
+    assert byid[a]["groups"] == ["Family"]
+    assert byid[a]["name"] == "Alex Fixture"
+    # query by phone fragment, name, org; container and group filters
+    assert json.loads(contacts.list_contacts(query="000-1111"))["count"] == 2
+    assert json.loads(contacts.list_contacts(query="blake"))["count"] == 1
+    assert json.loads(contacts.list_contacts(query="fixture co"))["count"] == 1
+    assert json.loads(contacts.list_contacts(container="iCloud"))["count"] == 2
+    assert json.loads(contacts.list_contacts(group="Family"))["count"] == 1
+
+
+def test_get_contact_by_name_and_ambiguity():
+    fake, a, b, c, gid = fresh()
+    got = json.loads(contacts.get_contact(name="Blake"))
+    assert got["identifier"] == c
+    ambiguous = json.loads(contacts.get_contact(name="Alex"))
+    assert "2 contacts match" in ambiguous["error"]
+    assert json.loads(contacts.get_contact(identifier=a))["name"] == "Alex Fixture"
+
+
+def test_find_duplicates():
+    fake, a, b, c, gid = fresh()
+    by_phone = json.loads(contacts.find_duplicates("phone"))
+    assert by_phone["count"] == 1
+    cluster = by_phone["clusters"][0]
+    assert {x["identifier"] for x in cluster["cards"]} == {a, b}
+    assert "organization" in cluster["differing_fields"]
+    assert "emails" in cluster["differing_fields"]
+    by_name = json.loads(contacts.find_duplicates("name"))
+    assert by_name["count"] == 1
+    assert json.loads(contacts.find_duplicates("email"))["count"] == 0
+    assert "error" in json.loads(contacts.find_duplicates("bogus"))
+
+
+def test_writes_refuse_without_confirm():
+    fake, a, b, c, gid = fresh()
+    log = os.environ["CONTACTS_CHANGES_LOG"]
+    size_before = os.path.getsize(log) if os.path.exists(log) else 0
+    for call in (
+        lambda: contacts.create_contact({"given_name": "X"}),
+        lambda: contacts.update_contact(a, {"given_name": "X"}),
+        lambda: contacts.delete_contact(a),
+        lambda: contacts.create_group("G"),
+        lambda: contacts.add_to_group(a, "Family"),
+        lambda: contacts.remove_from_group(a, "Family"),
+        lambda: contacts.move_to_container(b),
+        lambda: contacts.merge_contacts([a, b], keep=a),
+    ):
+        out = json.loads(call())
+        assert out["ok"] is False and "confirm" in out["error"]
+    assert len(fake.cards) == 3  # nothing changed
+    size_after = os.path.getsize(log) if os.path.exists(log) else 0
+    assert size_after == size_before  # refusals are never logged as changes
+
+
+def test_create_update_delete_and_log():
+    fake, a, b, c, gid = fresh()
+    out = json.loads(contacts.create_contact(
+        {"given_name": "Casey", "phones": [{"label": "mobile",
+                                            "value": "555-222-3333"}]},
+        confirm=True))
+    assert out["ok"] and out["contact"]["container"] == "iCloud"
+    new_id = out["contact"]["identifier"]
+    out = json.loads(contacts.update_contact(
+        new_id, {"organization": "Synthetic LLC"}, confirm=True))
+    assert out["contact"]["organization"] == "Synthetic LLC"
+    out = json.loads(contacts.delete_contact(new_id, confirm=True))
+    assert out["ok"] and new_id not in fake.cards
+    lines = [json.loads(l) for l in
+             open(os.environ["CONTACTS_CHANGES_LOG"], encoding="utf-8")]
+    assert [l["tool"] for l in lines] == [
+        "create_contact", "update_contact", "delete_contact"]
+    assert lines[1]["before"]["organization"] == ""
+    assert lines[1]["after"]["organization"] == "Synthetic LLC"
+    assert lines[2]["after"] is None
+
+
+def test_icloud_resolution_never_google():
+    fake, *_ = fresh()
+    assert contacts._resolve_container("iCloud")["id"] == "ICLOUD-1"
+    assert contacts._resolve_container("google")["id"] == "GOOGLE-1"
+    # Two non-Google CardDAV containers and none named 'Card' -> refuse.
+    fake.containers_list = [
+        {"id": "X1", "name": "Work CardDAV", "type": "cardDAV"},
+        {"id": "X2", "name": "Other CardDAV", "type": "cardDAV"},
+    ]
+    try:
+        contacts._resolve_container("iCloud")
+        assert False, "expected ambiguity error"
+    except RuntimeError as e:
+        assert "unambiguously" in str(e)
+
+
+def test_move_to_container():
+    fake, a, b, c, gid = fresh()
+    out = json.loads(contacts.move_to_container(b, "iCloud", confirm=True))
+    assert out["ok"]
+    moved = out["contact"]
+    assert moved["container"] == "iCloud"
+    assert moved["organization"] == "Fixture Co"
+    assert b not in fake.cards  # source deleted
+    # moving a card already there is refused
+    out = json.loads(contacts.move_to_container(
+        moved["identifier"], "iCloud", confirm=True))
+    assert out["ok"] is False and "already" in out["error"]
+
+
+def test_move_preserves_group_membership_in_target():
+    fake, a, b, c, gid = fresh()
+    ggroup = fake.create_group("Google Friends", "GOOGLE-1")
+    fake.add_member(b, ggroup)
+    icgroup = fake.create_group("Shared", "ICLOUD-1")
+    fake.add_member(b, icgroup)
+    out = json.loads(contacts.move_to_container(b, "iCloud", confirm=True))
+    assert out["groups_kept"] == ["Shared"]
+    assert out["groups_dropped"] == ["Google Friends"]
+
+
+def test_merge_contacts():
+    fake, a, b, c, gid = fresh()
+    out = json.loads(contacts.merge_contacts([a, b], keep=a, confirm=True))
+    assert out["ok"]
+    merged = out["contact"]
+    assert merged["identifier"] == a
+    # union of phones dedupes the same number in two formats
+    assert len(merged["phones"]) == 1
+    assert {e["value"] for e in merged["emails"]} == {
+        "alex@example.com", "afx@example.com"}
+    assert merged["organization"] == "Fixture Co"  # filled from the other card
+    assert b not in fake.cards
+    assert merged["groups"] == ["Family"]
+    # guards
+    assert json.loads(contacts.merge_contacts([a], keep=a, confirm=True))["ok"] is False
+    assert json.loads(contacts.merge_contacts([a, c], keep="nope",
+                                              confirm=True))["ok"] is False
+
+
+def test_merge_unions_groups():
+    fake, a, b, c, gid = fresh()
+    g2 = fake.create_group("Colleagues", "GOOGLE-1")
+    fake.add_member(b, g2)
+    out = json.loads(contacts.merge_contacts([a, b], keep=a, confirm=True))
+    assert set(out["contact"]["groups"]) == {"Family", "Colleagues"}
+
+
+def test_group_tools():
+    fake, a, b, c, gid = fresh()
+    out = json.loads(contacts.create_group("New Circle", confirm=True))
+    assert out["ok"]
+    out = json.loads(contacts.add_to_group(c, "New Circle", confirm=True))
+    assert out["added_to"] == "New Circle"
+    assert json.loads(contacts.get_contact(identifier=c))["groups"] == ["New Circle"]
+    out = json.loads(contacts.remove_from_group(c, "New Circle", confirm=True))
+    assert out["ok"]
+    assert json.loads(contacts.get_contact(identifier=c))["groups"] == []
+
+
+def test_helpers():
+    assert contacts._norm_phone("(423) 946-2258") == "4239462258"
+    assert contacts._clean_label("_$!<Mobile>!$_") == "mobile"
+    assert contacts._clean_label("custom") == "custom"
+    assert contacts._account_label(
+        {"id": "x", "name": "Card", "type": "cardDAV"}) == "iCloud"
+    assert contacts._account_label(
+        {"id": "x", "name": "Google (a@b.c)", "type": "cardDAV"}) == "Google"
+    assert contacts._account_label(
+        {"id": "x", "name": "On My Mac", "type": "local"}) == "local"
+
+
+if __name__ == "__main__":
+    fails = 0
+    for name, fn in sorted(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            try:
+                fn()
+                print(f"ok    {name}")
+            except AssertionError as e:
+                fails += 1
+                print(f"FAIL  {name}: {e}")
+    sys.exit(1 if fails else 0)
