@@ -109,6 +109,35 @@ def build(path):
     con.close()
 
 
+def build_addressbook(path):
+    """A synthetic AddressBook-v22.abcddb with just the tables we read.
+    'Alex Fixture' owns the +1 555 000 1111 number formatted the way macOS
+    stores it - with punctuation - to exercise handle normalization."""
+    con = sqlite3.connect(path)
+    con.executescript(
+        """
+        CREATE TABLE ZABCDRECORD (Z_PK INTEGER PRIMARY KEY, ZFIRSTNAME TEXT,
+                                  ZLASTNAME TEXT);
+        CREATE TABLE ZABCDPHONENUMBER (Z_PK INTEGER PRIMARY KEY,
+                                       ZOWNER INTEGER, ZFULLNUMBER TEXT);
+        CREATE TABLE ZABCDEMAILADDRESS (Z_PK INTEGER PRIMARY KEY,
+                                        ZOWNER INTEGER, ZADDRESS TEXT);
+        """
+    )
+    con.executemany(
+        "INSERT INTO ZABCDRECORD VALUES (?,?,?)",
+        [(1, "Alex", "Fixture"), (2, "Blake", "Sample")],
+    )
+    con.execute(
+        "INSERT INTO ZABCDPHONENUMBER VALUES (1, 1, '(555) 000-1111')"
+    )
+    con.execute(
+        "INSERT INTO ZABCDEMAILADDRESS VALUES (1, 2, 'Fixture@Example.com')"
+    )
+    con.commit()
+    con.close()
+
+
 if __name__ == "__main__":
     import sys
 

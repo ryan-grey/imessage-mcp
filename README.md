@@ -35,7 +35,10 @@ no way to do either. It does not control your screen.
 
 Messages come back with sender, direction (`from_me`), local ISO timestamp,
 chat name, body text, and attachments as filenames + paths only (the files
-themselves are never opened).
+themselves are never opened). When the AddressBook database is readable,
+handles are joined to contact names everywhere they appear — `sender_name`
+on messages, names on chat participants, and 1:1 chats titled by contact
+instead of raw number.
 
 ## Install
 
