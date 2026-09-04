@@ -97,12 +97,25 @@ def _clean_label(label):
     return (m.group(1) if m else str(label)).lower()
 
 
-def _date_label(label):
-    """The framework label for a date: 'anniversary' and 'other' map back
-    to Apple's built-ins so Contacts.app shows them as such; anything
-    else is stored as a custom label."""
-    builtins = {"anniversary": "_$!<Anniversary>!$_", "other": "_$!<Other>!$_"}
-    return builtins.get((label or "").strip().lower(), label or builtins["other"])
+_BUILTIN_LABELS = {
+    "home": "_$!<Home>!$_", "work": "_$!<Work>!$_", "other": "_$!<Other>!$_",
+    "mobile": "_$!<Mobile>!$_", "main": "_$!<Main>!$_",
+    "homefax": "_$!<HomeFAX>!$_", "workfax": "_$!<WorkFAX>!$_",
+    "otherfax": "_$!<OtherFAX>!$_", "pager": "_$!<Pager>!$_",
+    "school": "_$!<School>!$_", "homepage": "_$!<HomePage>!$_",
+    "anniversary": "_$!<Anniversary>!$_",
+    "iphone": "iPhone", "icloud": "iCloud", "apple watch": "Apple Watch",
+}
+
+
+def _raw_label(label, default):
+    """The inverse of _clean_label for writes: a cleaned built-in name
+    ('mobile', 'home', 'anniversary', 'iphone') maps back to Apple's
+    constant so Contacts.app keeps showing its localized label instead
+    of a custom lowercase one; anything else is stored as typed."""
+    if not label:
+        return default
+    return _BUILTIN_LABELS.get(str(label).strip().lower(), label)
 
 
 def _norm_date(d):
@@ -542,7 +555,7 @@ class _RealCN:
             mc.setUrlAddresses_(
                 [
                     C.CNLabeledValue.labeledValueWithLabel_value_(
-                        u.get("label") or C.CNLabelURLAddressHomePage,
+                        _raw_label(u.get("label"), C.CNLabelURLAddressHomePage),
                         u["value"],
                     )
                     for u in fields["urls"]
@@ -570,7 +583,8 @@ class _RealCN:
             mc.setDates_(
                 [
                     C.CNLabeledValue.labeledValueWithLabel_value_(
-                        _date_label(d.get("label")), self._date_components(d)
+                        _raw_label(d.get("label"), C.CNLabelOther),
+                        self._date_components(d),
                     )
                     for d in fields["dates"]
                     if d.get("month") and d.get("day")
@@ -587,7 +601,7 @@ class _RealCN:
             mc.setPhoneNumbers_(
                 [
                     C.CNLabeledValue.labeledValueWithLabel_value_(
-                        p.get("label") or C.CNLabelPhoneNumberMobile,
+                        _raw_label(p.get("label"), C.CNLabelPhoneNumberMobile),
                         C.CNPhoneNumber.phoneNumberWithStringValue_(p["value"]),
                     )
                     for p in fields["phones"]
@@ -597,7 +611,7 @@ class _RealCN:
             mc.setEmailAddresses_(
                 [
                     C.CNLabeledValue.labeledValueWithLabel_value_(
-                        e.get("label") or C.CNLabelHome, e["value"]
+                        _raw_label(e.get("label"), C.CNLabelHome), e["value"]
                     )
                     for e in fields["emails"]
                 ]
@@ -613,7 +627,7 @@ class _RealCN:
                 pa.setCountry_(a.get("country", ""))
                 vals.append(
                     C.CNLabeledValue.labeledValueWithLabel_value_(
-                        a.get("label") or C.CNLabelHome, pa
+                        _raw_label(a.get("label"), C.CNLabelHome), pa
                     )
                 )
             mc.setPostalAddresses_(vals)
