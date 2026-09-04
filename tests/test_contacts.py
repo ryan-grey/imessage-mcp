@@ -717,6 +717,24 @@ def test_real_adapter_date_components_and_keys():
     real._apply_fields(mc, {"birthday": None, "dates": []})
     assert mc.birthday() is None and list(mc.dates()) == []
 
+    # cleaned labels read back from a card are written as Apple's
+    # built-ins again, not as custom lowercase labels
+    real._apply_fields(mc, {
+        "phones": [{"label": "mobile", "value": "555-000-1111"},
+                   {"label": "iphone", "value": "555-000-2222"},
+                   {"label": "kayla (front desk)", "value": "555-000-3333"},
+                   {"label": "", "value": "555-000-4444"}],
+        "emails": [{"label": "home", "value": "a@example.com"},
+                   {"label": "icloud", "value": "b@example.com"}],
+        "urls": [{"label": "homepage", "value": "https://example.dev"}],
+    })
+    assert [str(lv.label()) for lv in mc.phoneNumbers()] == [
+        C.CNLabelPhoneNumberMobile, C.CNLabelPhoneNumberiPhone,
+        "kayla (front desk)", C.CNLabelPhoneNumberMobile]
+    assert [str(lv.label()) for lv in mc.emailAddresses()] == [
+        C.CNLabelHome, C.CNLabelEmailiCloud]
+    assert str(mc.urlAddresses()[0].label()) == C.CNLabelURLAddressHomePage
+
 
 def test_set_photo():
     fake, a, b, c, gid = fresh()
@@ -805,10 +823,17 @@ def test_helpers():
         {"id": "x", "name": "Google (a@b.c)", "type": "cardDAV"}) == "Google"
     assert contacts._account_label(
         {"id": "x", "name": "On My Mac", "type": "local"}) == "local"
-    assert contacts._date_label("anniversary") == "_$!<Anniversary>!$_"
-    assert contacts._date_label("Other") == "_$!<Other>!$_"
-    assert contacts._date_label("") == "_$!<Other>!$_"
-    assert contacts._date_label("graduation") == "graduation"
+    assert contacts._raw_label("anniversary", "x") == "_$!<Anniversary>!$_"
+    assert contacts._raw_label("Other", "x") == "_$!<Other>!$_"
+    assert contacts._raw_label("", "_$!<Other>!$_") == "_$!<Other>!$_"
+    assert contacts._raw_label(None, "dflt") == "dflt"
+    assert contacts._raw_label("graduation", "x") == "graduation"
+    assert contacts._raw_label("mobile", "x") == "_$!<Mobile>!$_"
+    assert contacts._raw_label("iphone", "x") == "iPhone"
+    assert contacts._raw_label("_$!<Home>!$_", "x") == "_$!<Home>!$_"
+    for name in ("mobile", "home", "work", "main", "iphone", "icloud",
+                 "homepage", "anniversary", "otherfax"):
+        assert contacts._clean_label(contacts._raw_label(name, "x")) == name
     assert contacts._norm_date({"label": "x", "month": 5, "day": 23}) == \
         contacts._norm_date({"label": "y", "year": None, "month": 5, "day": 23})
 
