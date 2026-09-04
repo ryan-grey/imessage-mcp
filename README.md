@@ -80,7 +80,10 @@ Card fields cover names, organization, `job_title`, `department`,
 `addresses` as `{label, street, city, state, postal_code, country}`,
 `social_profiles` as `{service, username, url}`, `birthday` as
 `{year?, month, day}` (year optional), `dates` as `{label, year?, month, day}`
-(label `anniversary` or `other`), and `has_image` (with
+(label `anniversary` or `other`), `contact_type` (`person` or
+`organization` — an organization card displays by company name even when it
+carries a given/family name, so converting a business card to a person means
+setting this too), and `has_image` (with
 `get_contact(..., include_photo=true)` returning a `photo_path` temp file).
 
 Cards that CNContactStore presents as unified (linked) contacts are labeled

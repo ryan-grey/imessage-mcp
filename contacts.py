@@ -161,6 +161,7 @@ def _merged_fields(cards, keep_id):
         for k in ("given_name", "middle_name", "family_name", "organization",
                   "job_title", "department", "nickname", "birthday")
     }
+    fields["contact_type"] = keep.get("contact_type") or "person"
     fields["dates"] = _union_labeled(
         keep.get("dates"), *[c.get("dates") for c in others], norm=_norm_date
     )
@@ -247,6 +248,7 @@ class _RealCN:
     def _keys(self, with_note):
         C = self._fw()
         keys = [
+            C.CNContactTypeKey,
             C.CNContactGivenNameKey,
             C.CNContactMiddleNameKey,
             C.CNContactFamilyNameKey,
@@ -305,6 +307,11 @@ class _RealCN:
         C = self._fw()
         card = {
             "identifier": str(c.identifier()),
+            "contact_type": (
+                "organization"
+                if int(c.contactType()) == C.CNContactTypeOrganization
+                else "person"
+            ),
             "given_name": str(c.givenName() or ""),
             "middle_name": str(c.middleName() or ""),
             "family_name": str(c.familyName() or ""),
@@ -551,6 +558,16 @@ class _RealCN:
         for key, setter in scalars.items():
             if key in fields:
                 setter(fields[key] or "")
+        if "contact_type" in fields:
+            kind = (fields["contact_type"] or "person").strip().lower()
+            if kind not in ("person", "organization"):
+                raise RuntimeError(
+                    "contact_type must be 'person' or 'organization'"
+                )
+            mc.setContactType_(
+                C.CNContactTypeOrganization if kind == "organization"
+                else C.CNContactTypePerson
+            )
         if "urls" in fields:
             mc.setUrlAddresses_(
                 [
@@ -1300,7 +1317,9 @@ def create_contact(fields: dict, container: str = "iCloud",
     [{label, value}], addresses as [{label, street, city, state,
     postal_code, country}], social_profiles as [{service, username,
     url?}], birthday as {year?, month, day}, dates as [{label, year?,
-    month, day}] (label 'anniversary' or 'other'). Requires confirm=true."""
+    month, day}] (label 'anniversary' or 'other'), contact_type 'person'
+    or 'organization' (an organization card displays by company name even
+    when it has a given/family name). Requires confirm=true."""
     if confirm is not True:
         return _refuse("create_contact")
     target = _resolve_container(container)
@@ -1439,7 +1458,7 @@ def move_to_container(identifier: str, container: str = "iCloud",
         for k, v in before.items()
         if k in ("given_name", "middle_name", "family_name", "organization",
                  "job_title", "department", "nickname", "birthday",
-                 "phones", "emails", "addresses",
+                 "contact_type", "phones", "emails", "addresses",
                  "urls", "social_profiles", "dates") and v
     }
     if before.get("note"):

@@ -112,7 +112,8 @@ class FakeCN:
     def group_member_ids(self, group_id):
         return sorted(self.members.get(group_id, set()))
 
-    BLANK = {"given_name": "", "middle_name": "", "family_name": "",
+    BLANK = {"contact_type": "person",
+             "given_name": "", "middle_name": "", "family_name": "",
              "organization": "", "job_title": "", "department": "",
              "nickname": "", "phones": [], "emails": [], "addresses": [],
              "urls": [], "social_profiles": [], "birthday": None,
@@ -682,6 +683,44 @@ def test_export_includes_birthday_and_dates():
     assert byid[a]["birthday"] == {"year": 2013, "month": 3, "day": 27}
     assert byid[a]["dates"] == [{"label": "anniversary", "month": 5, "day": 23}]
     assert byid[c]["birthday"] is None and byid[c]["dates"] == []
+
+
+def test_contact_type_roundtrip_and_merge():
+    fake, a, b, c, gid = fresh()
+    out = json.loads(contacts.create_contact(
+        {"organization": "Gutter Co", "contact_type": "organization"},
+        confirm=True))
+    card = out["contact"]
+    assert card["contact_type"] == "organization"
+    # converting to a person flips the type so Contacts shows the name
+    out = json.loads(contacts.update_contact(
+        card["identifier"],
+        {"given_name": "Kyle", "family_name": "Sample", "contact_type": "person"},
+        confirm=True))
+    assert out["contact"]["contact_type"] == "person"
+    assert json.loads(contacts.get_contact(identifier=a))["contact_type"] == "person"
+    # merge keeps the kept card's type
+    fake.update(c, {"contact_type": "organization"})
+    out = json.loads(contacts.merge_contacts([a, c], keep=a, confirm=True))
+    assert out["contact"]["contact_type"] == "person"
+
+
+def test_real_adapter_contact_type():
+    import Contacts as C
+
+    real = contacts._RealCN()
+    real._note_available = False
+    assert C.CNContactTypeKey in real._keys(with_note=False)
+    mc = C.CNMutableContact.alloc().init()
+    real._apply_fields(mc, {"contact_type": "organization"})
+    assert int(mc.contactType()) == C.CNContactTypeOrganization
+    real._apply_fields(mc, {"contact_type": "person"})
+    assert int(mc.contactType()) == C.CNContactTypePerson
+    try:
+        real._apply_fields(mc, {"contact_type": "robot"})
+        assert False, "expected a RuntimeError"
+    except RuntimeError as e:
+        assert "contact_type" in str(e)
 
 
 def test_real_adapter_date_components_and_keys():
