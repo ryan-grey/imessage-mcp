@@ -115,8 +115,8 @@ class FakeCN:
     BLANK = {"given_name": "", "middle_name": "", "family_name": "",
              "organization": "", "job_title": "", "department": "",
              "nickname": "", "phones": [], "emails": [], "addresses": [],
-             "urls": [], "social_profiles": [], "has_image": False,
-             "note": None}
+             "urls": [], "social_profiles": [], "birthday": None,
+             "dates": [], "has_image": False, "note": None}
 
     def create(self, fields, container_id):
         ident = self._new_id("CARD")
@@ -620,6 +620,104 @@ def test_merge_unions_urls_and_social_profiles():
     assert merged["social_profiles"][0]["username"] == "example"
 
 
+def test_birthday_and_dates_roundtrip():
+    fake, a, b, c, gid = fresh()
+    # birthday with a year, plus an anniversary and an 'other' date
+    out = json.loads(contacts.create_contact(
+        {"given_name": "Dana", "family_name": "Dates",
+         "birthday": {"year": 1990, "month": 3, "day": 27},
+         "dates": [{"label": "anniversary", "year": 2008, "month": 5, "day": 23},
+                   {"label": "other", "month": 6, "day": 5}]},
+        confirm=True))
+    card = out["contact"]
+    assert card["birthday"] == {"year": 1990, "month": 3, "day": 27}
+    assert card["dates"][0] == {"label": "anniversary", "year": 2008,
+                                "month": 5, "day": 23}
+    assert card["dates"][1] == {"label": "other", "month": 6, "day": 5}
+    # birthday without a year
+    out = json.loads(contacts.update_contact(
+        card["identifier"], {"birthday": {"month": 12, "day": 7}}, confirm=True))
+    assert out["contact"]["birthday"] == {"month": 12, "day": 7}
+    got = json.loads(contacts.get_contact(identifier=card["identifier"]))
+    assert got["birthday"] == {"month": 12, "day": 7}
+    assert len(got["dates"]) == 2
+    # every listed card carries both fields, empty or not
+    plain = json.loads(contacts.get_contact(identifier=a))
+    assert plain["birthday"] is None and plain["dates"] == []
+    # clearing
+    out = json.loads(contacts.update_contact(
+        card["identifier"], {"birthday": None, "dates": []}, confirm=True))
+    assert out["contact"]["birthday"] is None and out["contact"]["dates"] == []
+
+
+def test_merge_unions_dates_and_keeps_birthday():
+    fake, a, b, c, gid = fresh()
+    fake.update(a, {"birthday": {"month": 3, "day": 27},
+                    "dates": [{"label": "anniversary", "month": 5, "day": 23}]})
+    fake.update(b, {"birthday": {"year": 1990, "month": 1, "day": 1},
+                    "dates": [{"label": "anniversary", "month": 5, "day": 23},
+                              {"label": "other", "year": 2007, "month": 6,
+                               "day": 5}]})
+    fake.update(c, {"birthday": {"month": 9, "day": 9}})
+    out = json.loads(contacts.merge_contacts([a, b], keep=a, confirm=True))
+    merged = out["contact"]
+    assert merged["birthday"] == {"month": 3, "day": 27}  # keep's wins
+    assert merged["dates"] == [
+        {"label": "anniversary", "month": 5, "day": 23},
+        {"label": "other", "year": 2007, "month": 6, "day": 5}]
+    # a keep card without a birthday inherits the other's
+    fake.update(a, {"birthday": None})
+    out = json.loads(contacts.merge_contacts([a, c], keep=a, confirm=True))
+    assert out["contact"]["birthday"] == {"month": 9, "day": 9}
+
+
+def test_export_includes_birthday_and_dates():
+    fake, a, b, c, gid = fresh()
+    fake.update(a, {"birthday": {"year": 2013, "month": 3, "day": 27},
+                    "dates": [{"label": "anniversary", "month": 5, "day": 23}]})
+    exported = json.loads(contacts.export_contacts(
+        path=os.path.join(_TMP, "backups-dates")))
+    doc = json.load(open(exported["json"], encoding="utf-8"))
+    byid = {x["identifier"]: x for x in doc["contacts"]}
+    assert byid[a]["birthday"] == {"year": 2013, "month": 3, "day": 27}
+    assert byid[a]["dates"] == [{"label": "anniversary", "month": 5, "day": 23}]
+    assert byid[c]["birthday"] is None and byid[c]["dates"] == []
+
+
+def test_real_adapter_date_components_and_keys():
+    """The framework side of birthday/dates: NSDateComponents round-trips
+    with and without a year, the fetch keys include both date keys, and
+    date labels map back to Apple's built-ins. No store access."""
+    import Contacts as C
+
+    real = contacts._RealCN()
+    real._note_available = False
+    keys = real._keys(with_note=False)
+    assert C.CNContactBirthdayKey in keys and C.CNContactDatesKey in keys
+
+    with_year = real._date_components({"year": 2008, "month": 5, "day": 23})
+    assert real._date_dict(with_year) == {"year": 2008, "month": 5, "day": 23}
+    no_year = real._date_components({"month": 6, "day": 17})
+    assert real._date_dict(no_year) == {"year": None, "month": 6, "day": 17}
+    assert real._date_components(None) is None
+    assert real._date_dict(None) is None
+
+    mc = C.CNMutableContact.alloc().init()
+    real._apply_fields(mc, {
+        "birthday": {"month": 6, "day": 17},
+        "dates": [{"label": "anniversary", "year": 2008, "month": 5, "day": 23},
+                  {"label": "Other", "month": 1, "day": 2},
+                  {"label": "graduation", "month": 5, "day": 30}],
+    })
+    assert real._date_dict(mc.birthday()) == {"year": None, "month": 6, "day": 17}
+    labels = [str(lv.label()) for lv in mc.dates()]
+    assert labels == [C.CNLabelDateAnniversary, C.CNLabelOther, "graduation"]
+    assert [contacts._clean_label(l) for l in labels] == [
+        "anniversary", "other", "graduation"]
+    real._apply_fields(mc, {"birthday": None, "dates": []})
+    assert mc.birthday() is None and list(mc.dates()) == []
+
+
 def test_set_photo():
     fake, a, b, c, gid = fresh()
     big = os.path.join(_TMP, "big.png")
@@ -707,6 +805,12 @@ def test_helpers():
         {"id": "x", "name": "Google (a@b.c)", "type": "cardDAV"}) == "Google"
     assert contacts._account_label(
         {"id": "x", "name": "On My Mac", "type": "local"}) == "local"
+    assert contacts._date_label("anniversary") == "_$!<Anniversary>!$_"
+    assert contacts._date_label("Other") == "_$!<Other>!$_"
+    assert contacts._date_label("") == "_$!<Other>!$_"
+    assert contacts._date_label("graduation") == "graduation"
+    assert contacts._norm_date({"label": "x", "month": 5, "day": 23}) == \
+        contacts._norm_date({"label": "y", "year": None, "month": 5, "day": 23})
 
 
 if __name__ == "__main__":

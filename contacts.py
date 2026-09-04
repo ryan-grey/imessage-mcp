@@ -97,6 +97,22 @@ def _clean_label(label):
     return (m.group(1) if m else str(label)).lower()
 
 
+def _date_label(label):
+    """The framework label for a date: 'anniversary' and 'other' map back
+    to Apple's built-ins so Contacts.app shows them as such; anything
+    else is stored as a custom label."""
+    builtins = {"anniversary": "_$!<Anniversary>!$_", "other": "_$!<Other>!$_"}
+    return builtins.get((label or "").strip().lower(), label or builtins["other"])
+
+
+def _norm_date(d):
+    """Dedupe key for a {year?, month, day} dict: same calendar day."""
+    return json.dumps(
+        {"year": d.get("year"), "month": d.get("month"), "day": d.get("day")},
+        sort_keys=True,
+    )
+
+
 def _display_name(card):
     name = " ".join(
         p
@@ -130,8 +146,11 @@ def _merged_fields(cards, keep_id):
             (c.get(k) for c in others if c.get(k)), None
         )
         for k in ("given_name", "middle_name", "family_name", "organization",
-                  "job_title", "department", "nickname")
+                  "job_title", "department", "nickname", "birthday")
     }
+    fields["dates"] = _union_labeled(
+        keep.get("dates"), *[c.get("dates") for c in others], norm=_norm_date
+    )
     fields["phones"] = _union_labeled(
         keep.get("phones"), *[c.get("phones") for c in others], norm=_norm_phone
     )
@@ -227,11 +246,47 @@ class _RealCN:
             C.CNContactPostalAddressesKey,
             C.CNContactUrlAddressesKey,
             C.CNContactSocialProfilesKey,
+            C.CNContactBirthdayKey,
+            C.CNContactDatesKey,
             C.CNContactImageDataAvailableKey,
         ]
         if with_note:
             keys.append(C.CNContactNoteKey)
         return keys
+
+    @staticmethod
+    def _date_dict(dc):
+        """NSDateComponents -> {year?, month, day}; None when unset. An
+        absent component reads as NSDateComponentUndefined (NSIntegerMax),
+        which is what a year-less birthday looks like."""
+        if dc is None:
+            return None
+        undefined = 0x7FFFFFFFFFFFFFFF
+
+        def part(v):
+            v = int(v)
+            return None if v == undefined else v
+
+        return {"year": part(dc.year()), "month": part(dc.month()),
+                "day": part(dc.day())}
+
+    def _date_components(self, d):
+        """{year?, month, day} -> NSDateComponents (Gregorian), or None."""
+        if not d:
+            return None
+        import Foundation as F
+
+        dc = F.NSDateComponents.alloc().init()
+        dc.setCalendar_(
+            F.NSCalendar.calendarWithIdentifier_(F.NSCalendarIdentifierGregorian)
+        )
+        if d.get("month"):
+            dc.setMonth_(int(d["month"]))
+        if d.get("day"):
+            dc.setDay_(int(d["day"]))
+        if d.get("year"):
+            dc.setYear_(int(d["year"]))
+        return dc
 
     def _shape(self, c):
         C = self._fw()
@@ -255,6 +310,12 @@ class _RealCN:
                     "url": str(lv.value().urlString() or ""),
                 }
                 for lv in c.socialProfiles()
+            ],
+            "birthday": self._date_dict(c.birthday()),
+            "dates": [
+                {"label": _clean_label(lv.label()),
+                 **self._date_dict(lv.value())}
+                for lv in c.dates()
             ],
             "has_image": bool(
                 c.isKeyAvailable_(C.CNContactImageDataAvailableKey)
@@ -501,6 +562,18 @@ class _RealCN:
                         ),
                     )
                     for p in fields["social_profiles"]
+                ]
+            )
+        if "birthday" in fields:
+            mc.setBirthday_(self._date_components(fields["birthday"]))
+        if "dates" in fields:
+            mc.setDates_(
+                [
+                    C.CNLabeledValue.labeledValueWithLabel_value_(
+                        _date_label(d.get("label")), self._date_components(d)
+                    )
+                    for d in fields["dates"]
+                    if d.get("month") and d.get("day")
                 ]
             )
         if "note" in fields:
@@ -1212,7 +1285,8 @@ def create_contact(fields: dict, container: str = "iCloud",
     job_title, department, nickname, note, phones/emails/urls as
     [{label, value}], addresses as [{label, street, city, state,
     postal_code, country}], social_profiles as [{service, username,
-    url?}]. Requires confirm=true."""
+    url?}], birthday as {year?, month, day}, dates as [{label, year?,
+    month, day}] (label 'anniversary' or 'other'). Requires confirm=true."""
     if confirm is not True:
         return _refuse("create_contact")
     target = _resolve_container(container)
@@ -1350,9 +1424,9 @@ def move_to_container(identifier: str, container: str = "iCloud",
         k: v
         for k, v in before.items()
         if k in ("given_name", "middle_name", "family_name", "organization",
-                 "job_title", "department", "nickname",
+                 "job_title", "department", "nickname", "birthday",
                  "phones", "emails", "addresses",
-                 "urls", "social_profiles") and v
+                 "urls", "social_profiles", "dates") and v
     }
     if before.get("note"):
         fields["note"] = before["note"]
@@ -1388,8 +1462,8 @@ def move_to_container(identifier: str, container: str = "iCloud",
 
 
 def merge_contacts(identifiers: list, keep: str, confirm: bool = False) -> str:
-    """Merge duplicate cards: union of phones/emails/addresses/notes/groups
-    lands on the kept card, the others are deleted. keep must be one of
+    """Merge duplicate cards: union of phones/emails/addresses/dates/notes/
+    groups lands on the kept card, the others are deleted. keep must be one of
     identifiers. Requires confirm=true. Returns the merged card."""
     if confirm is not True:
         return _refuse("merge_contacts")
