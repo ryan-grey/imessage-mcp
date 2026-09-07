@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""iMessage, as a local MCP server for the MCP desktop client.
+"""iMessage, as a local MCP server owned and maintained by Ryan Grey.
 
 Search, list, read and send Apple Messages on this Mac. Everything is local:
 the message database is opened strictly read-only, sending goes through
@@ -10,11 +10,11 @@ Setup, once:
     python3 -m venv ~/.local/imessage-mcp/.venv
     ~/.local/imessage-mcp/.venv/bin/pip install mcp
 
-then register in your MCP client configuration:
+then register in your MCP client's configuration:
 
     "imessage": {
       "command": "/Users/<you>/.local/imessage-mcp/.venv/bin/python",
-      "args": ["/Users/<you>/Documents/imessage-mcp/server.py"]
+      "args": ["/Users/<you>/Developer/imessage-mcp/server.py"]
     }
 
 Two manual macOS grants are required - see README.md:

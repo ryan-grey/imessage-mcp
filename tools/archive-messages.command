@@ -1,8 +1,8 @@
 #!/bin/bash
 # Snapshot the entire iMessage history into a read-only archive folder.
 # Runs in Terminal.app (double-click in Finder) because reading
-# ~/Library/Messages needs Full Disk Access, which Terminal has and
-# other launching apps may not.
+# ~/Library/Messages needs Full Disk Access granted to the launching app.
+# Owner and maintainer: Ryan Grey.
 #
 # Copies chat.db with SQLite's online backup API (consistent even while
 # Messages.app is running), checks integrity, records counts, adds the
@@ -16,7 +16,7 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 DAY="$(date +%Y-%m-%d)"
 DEST="$HOME/Documents/imessage-archive/$DAY"
 SRC="$HOME/Library/Messages/chat.db"
-MCP="$HOME/Documents/imessage-mcp"
+MCP="$HOME/Developer/imessage-mcp"
 
 step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 
@@ -113,6 +113,8 @@ du -sh .
 
 cat <<EOF
 
-Local archive complete. Ryan Grey manages remote backups separately. Press return to close this window.
+Local archive complete. Ryan Grey manages off-machine backups separately;
+this script has not uploaded or verified a remote copy.
+Press return to close this window.
 EOF
 read -r _

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apple Contacts, as a local MCP server for the MCP desktop client.
+"""Apple Contacts, as a local MCP server owned and maintained by Ryan Grey.
 
 Sibling to server.py (iMessage) in the same repo and venv. List, search,
 create, update, merge and organize contacts - through Contacts.framework
@@ -12,15 +12,15 @@ Setup (shares the imessage-mcp venv):
 
     ~/.local/imessage-mcp/.venv/bin/pip install mcp pyobjc-core pyobjc-framework-Contacts
 
-then register in your MCP client configuration:
+then set up Ryan Contacts (helper/README.md) and register in your MCP client:
 
     "contacts": {
       "command": "/Users/<you>/.local/imessage-mcp/.venv/bin/python",
-      "args": ["/Users/<you>/Documents/imessage-mcp/contacts.py"]
+      "args": ["/Users/<you>/Developer/imessage-mcp/helper/bridge.py"]
     }
 
-macOS will prompt for Contacts access for the app that runs this server on
-first use (System Settings > Privacy & Security > Contacts).
+Request Contacts access explicitly in the Ryan Contacts settings window.
+Manage the grant in System Settings > Privacy & Security > Contacts.
 
 Safety, by construction:
   - Every write tool refuses unless confirm=true.
@@ -224,24 +224,12 @@ class _RealCN:
             C.CNEntityTypeContacts
         )
         store = C.CNContactStore.alloc().init()
-        if status == 0:  # not determined - trigger the system prompt
-            done = threading.Event()
-            result = {}
-
-            def handler(granted, error):
-                result["granted"] = bool(granted)
-                done.set()
-
-            store.requestAccessForEntityType_completionHandler_(
-                C.CNEntityTypeContacts, handler
-            )
-            done.wait(120)
-            status = 3 if result.get("granted") else 2
         if status not in (3, 4):  # authorized / limited
             raise RuntimeError(
-                "Contacts access is not granted. Allow it under System "
-                "Settings > Privacy & Security > Contacts for the app that "
-                "runs this server (the MCP desktop client), then retry."
+                "Contacts access is not granted. Open Ryan Contacts and "
+                "choose Request Contacts Access, then allow Ryan Contacts "
+                "under System Settings > Privacy & Security > Contacts. "
+                "Direct server launches use their own host's permission."
             )
         return store
 
@@ -1191,11 +1179,9 @@ def authorization_status() -> str:
             "status": status,
             "meaning": labels.get(status, f"unknown({status})"),
             "python": sys.executable,
-            "note": "macOS attributes the grant to the app that launches "
-            "this server - the MCP desktop client when spawned from "
-            "your MCP client configuration, or your terminal app when run by "
-            "hand. Grant lives under System Settings > Privacy & Security "
-            "> Contacts.",
+            "note": "The shared local bridge uses the Ryan Contacts "
+            "permission grant. Direct launches use their own host's grant. "
+            "Manage access in System Settings > Privacy & Security > Contacts.",
         }
     )
 

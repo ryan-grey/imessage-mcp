@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>dev.ryangrey.contacts-helper</string>
+<key>CFBundleName</key><string>Ryan Contacts</string>
+<key>CFBundleDisplayName</key><string>Ryan Contacts</string>
+<key>CFBundleExecutable</key><string>RyanContacts</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>LSUIElement</key><true/>
+<key>CFBundleVersion</key><string>1</string>
+<key>CFBundleShortVersionString</key><string>1.0.0</string>
+<key>NSContactsUsageDescription</key><string>Ryan Contacts provides your contacts to your local MCP clients. Contact changes require explicit confirmation in the client.</string>
+</dict></plist>

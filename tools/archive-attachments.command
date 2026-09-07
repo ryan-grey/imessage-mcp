@@ -2,6 +2,7 @@
 # Add the Messages attachments folder to today's read-only iMessage archive
 # as a single tar file. Runs in Terminal.app (double-click) for Full Disk
 # Access, same as archive-messages.command, which must have run first.
+# Owner and maintainer: Ryan Grey.
 
 set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
@@ -46,7 +47,8 @@ du -sh .
 
 cat <<EOF
 
-Local attachments archive complete. Ryan Grey manages remote backups separately.
+Local attachments archive complete. Ryan Grey manages off-machine backups
+separately; this script has not uploaded or verified a remote copy.
 Press return to close this window.
 EOF
 read -r _

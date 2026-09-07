@@ -1,8 +1,8 @@
 # imessage-mcp
 
-Local [MCP](https://modelcontextprotocol.io) servers that give the MCP
-desktop client access to Apple Messages and Apple Contacts on your Mac — all
-locally, with no network calls.
+Local [MCP](https://modelcontextprotocol.io) servers owned and maintained by
+Ryan Grey, providing MCP clients access to Apple Messages and Apple Contacts
+on your Mac.
 
 - **`server.py` (iMessage)** — search your message history, list chats, read
   threads, resolve contact names to handles, and send iMessages.
@@ -64,7 +64,7 @@ fed the join.
 | `get_contact(identifier \| name)` | One fully annotated card; an ambiguous name returns the candidates. |
 | `find_duplicates(strategy)` | Clusters sharing a phone, email, or normalized name, with the fields that differ between the cards (phones/emails capped at 5 per card with a `+N more` marker). |
 | `linked_cards(identifier \| name)` | The per-account cards behind one unified contact — identifier, container, full fields, groups, and which fields differ. Accepts the unified id or any piece id. |
-| `export_contacts(container?, path?)` | Restorable backup pair: an Apple-serialized vCard 3.0 file (photos included) plus a JSON file carrying what vCard drops — per-card container, group memberships, and linked pieces. Defaults to `~/Documents/contacts-backups/`. |
+| `export_contacts(container?, path?)` | Restorable backup pair: an Apple-serialized vCard 3.0 file (photos included) plus a JSON file carrying what vCard drops — per-card container, group memberships, and linked pieces. Defaults to `~/Documents/contacts-backups/`; existing backups are not moved. Override with `CONTACTS_BACKUP_DIR` or `path`. |
 | `authorization_status()` | The raw Contacts TCC state (`notDetermined`/`denied`/`authorized`/…) without triggering the permission prompt — tells a denied grant apart from a code bug. |
 | `create_contact(fields, container="iCloud", confirm)` | New card in an explicit container. |
 | `update_contact(identifier, fields, confirm)` | Replace the given fields on a card. |
@@ -116,7 +116,7 @@ Contacts safety rules:
 Requires macOS and Python 3.10+.
 
 ```sh
-git clone https://github.com/ryan-grey/imessage-mcp ~/Documents/imessage-mcp
+git clone https://github.com/ryan-grey/imessage-mcp ~/Developer/imessage-mcp
 python3 -m venv ~/.local/imessage-mcp/.venv
 ~/.local/imessage-mcp/.venv/bin/pip install mcp pyobjc-core pyobjc-framework-Contacts
 ```
@@ -124,33 +124,29 @@ python3 -m venv ~/.local/imessage-mcp/.venv
 (`pyobjc-*` is only needed for the Contacts server; the iMessage server has
 no dependencies beyond `mcp`.)
 
-Note on the Contacts grant: macOS attributes it to the **app that launches
-the server**, not to the venv's python binary — so when the MCP desktop
-client spawns it, the client name is what appears (and must be enabled) under System
-Settings → Privacy & Security → Contacts; run it from a terminal and the
-grant belongs to the terminal app instead. The `authorization_status` tool
-reports the live state for whichever context the server is running in.
+Set up [Ryan Contacts](helper/README.md), the permissioned helper owned by
+Ryan Grey. It runs hidden and owns the Contacts grant for bridged sessions.
+The `authorization_status` tool reports the live server's permission state.
 
-Then register them in the MCP desktop client's MCP config
-(`<your MCP client configuration file>`):
+Register the servers in your MCP client's configuration, adapting this
+example to its configuration format:
 
 ```json
 {
   "mcpServers": {
     "imessage": {
       "command": "/Users/YOU/.local/imessage-mcp/.venv/bin/python",
-      "args": ["/Users/YOU/Documents/imessage-mcp/server.py"]
+      "args": ["/Users/YOU/Developer/imessage-mcp/server.py"]
     },
     "contacts": {
       "command": "/Users/YOU/.local/imessage-mcp/.venv/bin/python",
-      "args": ["/Users/YOU/Documents/imessage-mcp/contacts.py"]
+      "args": ["/Users/YOU/Developer/imessage-mcp/helper/bridge.py"]
     }
   }
 }
 ```
 
-Restart the MCP desktop client and the `imessage` and `contacts` tools
-appear.
+Restart your MCP client to load the `imessage` and `contacts` tools.
 
 ## The macOS permission grants
 
@@ -158,19 +154,17 @@ Nothing works until you grant these — all are manual, by Apple's design:
 
 1. **Full Disk Access** for the process that runs the server. Open
    **System Settings → Privacy & Security → Full Disk Access** and add the
-   app that spawns the server — for the setup above that is the **MCP desktop client** (the Python interpreter inherits the grant from the app that
-   launches it). If you run the server from a terminal instead, grant your
+   app that spawns the Messages server. If you run it from a terminal, grant your
    terminal app. Without this, opening `chat.db` fails with
    "authorization denied".
 2. **Automation** for Messages, on first send. The first time
    `send_message` runs, macOS shows a prompt asking to allow the controlling
    app to control **Messages**. Click Allow. If you dismissed it, re-enable
    under **System Settings → Privacy & Security → Automation**.
-3. **Contacts** access, for the Contacts server. The first Contacts tool
-   call triggers the system prompt for the app that runs the server (the
-   MCP desktop client, or your terminal/python if run by hand). If you
-   dismissed it, re-enable under **System Settings → Privacy & Security →
-   Contacts**.
+3. **Contacts** access for **Ryan Contacts**. Open its explicit settings
+   window using the helper instructions and choose **Request Contacts Access**.
+   Server calls never trigger permission prompts implicitly. Manage the grant
+   under **System Settings → Privacy & Security → Contacts**.
 
 Messages must be signed in to your Apple account for sending to work. The
 app can be closed — AppleScript launches it as needed.
