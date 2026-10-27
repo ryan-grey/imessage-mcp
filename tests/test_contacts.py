@@ -179,6 +179,7 @@ class FakeCN:
 
 
 def fresh():
+    Path(os.environ["CONTACTS_CHANGES_LOG"]).unlink(missing_ok=True)
     fake = FakeCN()
     contacts.CN = fake
     contacts._GROUPS["at"] = 0.0  # drop the group-map cache with the fake
